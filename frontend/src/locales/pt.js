@@ -227,6 +227,8 @@ export default {
   'Passkeys use {0} — no passwords.': 'As passkeys usam {0} — sem palavras-passe.',
   'Each profile keeps its own plan, workouts & body weight.': 'Cada perfil guarda o seu plano, treinos e peso corporal.',
   'Account': 'Conta',
+  'Subscription': 'Assinatura',
+  'Plan status, payment and renewal.': 'Estado do plano, pagamento e renovação.',
   'Signed in with passkey — data syncs to this profile.': 'Sessão iniciada com passkey — os dados sincronizam com este perfil.',
   'Sign out?': 'Terminar sessão?',
   'Your data is synced to your profile first, then cleared from this device.': 'Os teus dados são primeiro sincronizados com o perfil e depois apagados deste dispositivo.',

@@ -7,7 +7,7 @@ import { MOBILE, nativeLoad, nativeSave, syncReminder } from '../lib/mobile.js'
 
 const KEY = 'gym_state_v1'
 export const DEF = {
-  unit: 'kg', restSec: 90, sound: true, keepAwake: true, lang: 'en',
+  unit: 'kg', restSec: 90, sound: true, keepAwake: true, lang: 'pt',
   theme: 'dark', accent: 'lime', body: 'male', targetW: null,
   bodyweight: [], routines: [], week: {}, dayPlan: {},
   exWeights: {}, workouts: [], active: null, customEx: [], gifSize: 'full',
@@ -87,6 +87,9 @@ export const useStore = create((set, get) => {
     S: (() => { const s = loadState(); registerCustom(s.customEx); return s })(),
     user: (() => { try { return JSON.parse(localStorage.getItem('gym_user')) || null } catch { return null } })(),
     ready: false,
+    // Assinatura do perfil autenticado (server flavor): { code, trialEndsAt, periodEnd, pending }.
+    // null enquanto não veio do /api/me — o gate só fecha com dado confirmado pelo servidor.
+    billing: null,
     // Instance capabilities from GET /api/config. `config.coach` is present only when the
     // owner has both enabled the Coach and connected a provider — every Coach entry point in
     // the app hangs off it, so an unconfigured instance renders exactly what it always did.
@@ -107,6 +110,16 @@ export const useStore = create((set, get) => {
       if (u) { localStorage.setItem('gym_user', JSON.stringify(u)); localStorage.removeItem('gym_guest') }
       else localStorage.removeItem('gym_user')
       set({ user: u })
+    },
+
+    // Re-consulta a assinatura no servidor (tela de billing: "verificar novamente").
+    // Devolve o code para o caller decidir navegar; erro devolve null sem quebrar.
+    async refreshBilling() {
+      try {
+        const { billing } = await api('/api/billing/status')
+        set({ billing })
+        return billing || null
+      } catch { return null }
     },
 
     async pushState() {
@@ -185,6 +198,7 @@ export const useStore = create((set, get) => {
       try {
         const me = await api('/api/me')
         get().setUser(me.user)
+        set({ billing: me.user?.billing || null })
         await get().pullState()
         // Re-stamp the reminder's timezone on every load — keeps it correct if you're travelling,
         // without needing to revisit Settings.

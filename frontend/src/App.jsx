@@ -8,6 +8,8 @@ import { setLang, useLang } from './lib/i18n.js'
 import { setNav } from './lib/nav.js'
 import { useWakeLock } from './lib/wakelock.js'
 import { startFlow } from './sheets.jsx'
+import { MOBILE } from './lib/mobile.js'
+import { DEMO } from './lib/demo.js'
 import Icon from './components/Icon.jsx'
 import TabBar from './components/TabBar.jsx'
 import ErrorBoundary from './components/ErrorBoundary.jsx'
@@ -27,6 +29,10 @@ import Admin from './views/Admin.jsx'
 import Coach from './views/Coach.jsx'
 import CoachIntake from './views/CoachIntake.jsx'
 import CoachProposal from './views/CoachProposal.jsx'
+import Landing from './views/Landing.jsx'
+import Auth from './views/Auth.jsx'
+import Billing from './views/Billing.jsx'
+import PanelRoot from './views/PanelRoot.jsx'
 
 bindUI(useUI)   // lets the shared controls open sheets without importing the store at module scope
 
@@ -38,16 +44,18 @@ function applyPrefs(theme, accent) {
   if (meta) meta.content = de.dataset.theme === 'light' ? '#f2f2f7' : '#000000'
 }
 
+// Áreas públicas/standalone (server flavor): landing, entrar, painel e gate de assinatura.
+// Não usam o shell do app (sem #app estreito, sem TabBar). MOBILE/DEMO mantêm o fluxo antigo.
 function Shell() {
   const navigate = useNavigate()
   const loc = useLocation()
-  const { S, user, ready } = useStore()
+  const { S, user, ready, billing } = useStore()
   const isGuest = useStore(s => s.isGuest())
   const langV = useLang()   // re-renders the whole shell when the language (pack) changes
   useEffect(() => { setNav(navigate) }, [navigate])
   useEffect(() => { applyPrefs(S.theme, S.accent) }, [S.theme, S.accent])
-  useEffect(() => { setLang(S.lang || 'en') }, [S.lang])
-  useEffect(() => { document.documentElement.lang = S.lang || 'en' }, [langV, S.lang])
+  useEffect(() => { setLang(S.lang || 'pt') }, [langV, S.lang])
+  useEffect(() => { document.documentElement.lang = S.lang || 'pt' }, [langV, S.lang])
   // every tab/route change starts at the top of the page
   useEffect(() => { window.scrollTo(0, 0) }, [loc.pathname])
   // bound to the workout, not to the route — checking Stats mid-session keeps the screen on
@@ -62,13 +70,37 @@ function Shell() {
     </div>
   )
 
+  const publicFlavor = !MOBILE && !DEMO
+  const p = loc.pathname
+  const isLanding = publicFlavor && p === '/'
+  const isAuth = publicFlavor && p === '/entrar'
+  const isPanel = publicFlavor && p === '/painel'
+  // Gate de assinatura: perfil autenticado que o servidor confirmou estar vencido.
+  // billing null (ainda carregando / offline) não fecha a porta — a API é quem decide.
+  const gate = publicFlavor && user && billing?.code === 'overdue'
+
+  if (gate || isLanding || isAuth || isPanel) {
+    const view = isPanel ? <PanelRoot />
+      : isAuth ? (user ? <Navigate to="/home" replace /> : <Auth />)
+      : isLanding ? (user ? <Navigate to="/home" replace /> : <Landing />)
+      : <Billing />   // gate
+    return (
+      <>
+        <ErrorBoundary key={'stand:' + loc.pathname}>
+          {view}
+        </ErrorBoundary>
+        <Toast />
+      </>
+    )
+  }
+
   return (
     <>
       {/* keyed on the route: a view that throws is contained, and switching tabs
           re-mounts the boundary, so the tab bar is always a way out */}
       <div id="app" className="vfade" key={loc.pathname}>
         <ErrorBoundary>
-          {!authed ? <Login /> : (
+          {!authed ? (publicFlavor ? <Navigate to="/entrar" replace /> : <Login />) : (
             <Routes>
               <Route path="/home" element={<Home />} />
               <Route path="/plan" element={<Plan />} />
@@ -78,6 +110,9 @@ function Shell() {
               <Route path="/history" element={<History />} />
               <Route path="/library" element={<Library />} />
               <Route path="/settings" element={<Settings />} />
+              {/* A área do app não exibe "/" — landing é pública e mora fora do shell. */}
+              {publicFlavor && <Route path="/" element={<Navigate to="/home" replace />} />}
+              {publicFlavor && <Route path="/billing" element={<Billing />} />}
               {/* The Coach screens gate themselves on the instance config; the routes exist
                   unconditionally so a deep link from a notification lands somewhere sane
                   rather than on the catch-all. */}

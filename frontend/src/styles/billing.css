@@ -1,0 +1,66 @@
+/* Tela de assinatura (gate) — mesma família visual da autenticação. */
+
+.bi-page{
+  background:var(--bg);color:var(--label);
+  min-height:100vh;display:flex;align-items:center;justify-content:center;
+  padding:26px 18px;
+}
+.bi-card{
+  width:min(440px,100%);background:var(--surface);border-radius:var(--r-xl);
+  padding:34px 28px 26px;text-align:center;
+  box-shadow:0 30px 80px -30px rgba(0,0,0,.7);
+}
+.bi-logo{
+  width:56px;height:56px;border-radius:18px;margin:0 auto 12px;
+  background:var(--acc-soft);color:var(--acc);
+  display:flex;align-items:center;justify-content:center;font-size:30px;
+}
+.bi-card h1{font-size:24px;font-weight:700;letter-spacing:-.025em;margin:0 0 18px}
+
+.bi-status{text-align:left;margin-bottom:18px}
+.bi-status-ic{
+  width:42px;height:42px;border-radius:12px;background:color-mix(in srgb, var(--orange) 18%, transparent);
+  color:var(--orange);display:flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:10px;
+}
+.bi-status h2{font-size:18px;font-weight:600;letter-spacing:-.02em;margin:0 0 6px}
+.bi-status p{color:var(--label-2);font-size:14px;line-height:1.55;margin:0}
+
+.bi-status-ic.ok{background:var(--acc-soft);color:var(--acc)}
+.bi-status.ok h2{color:var(--label)}
+
+.bi-price{
+  display:flex;align-items:baseline;justify-content:center;gap:10px;
+  background:var(--bg-el);border-radius:var(--r);padding:14px;margin-bottom:16px;
+}
+.bi-price-val strong{font-size:30px;font-weight:700;letter-spacing:-.02em}
+.bi-price-val{color:var(--label-2);font-size:14px}
+.bi-price-tag{color:var(--label-3);font-size:12.5px}
+
+.bi-warn{
+  background:color-mix(in srgb, var(--orange) 14%, transparent);color:var(--orange);
+  border-radius:var(--r);padding:13px 14px;font-size:13.5px;line-height:1.5;text-align:left;margin-bottom:14px;
+}
+
+.bi-pix{text-align:left}
+.bi-pix-hint{color:var(--label-2);font-size:14px;margin-bottom:10px}
+.bi-pix-key{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  background:var(--bg-el);border-radius:var(--r);padding:12px 14px;margin-bottom:8px;
+}
+.bi-pix-label{color:var(--label-3);font-size:12px;margin-bottom:3px}
+.bi-pix-val{font-weight:600;font-size:14.5px;word-break:break-all;user-select:all}
+.bi-pix-amount{color:var(--label-2);font-size:13.5px;margin-bottom:14px}
+.bi-pix-amount strong{color:var(--label)}
+.bi-hint{color:var(--label-3);font-size:12.5px;line-height:1.5;margin-top:10px}
+
+.bi-pending{text-align:center;background:var(--bg-el);border-radius:var(--r);padding:18px 14px}
+.bi-pending-ic{color:var(--acc);font-size:26px;margin-bottom:8px}
+.bi-pending strong{display:block;font-size:15px;margin-bottom:6px}
+.bi-pending p{color:var(--label-2);font-size:13.5px;line-height:1.55;margin:0 0 12px}
+
+.bi-mp{margin-top:6px}
+
+.bi-foot{margin-top:22px;font-size:13.5px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
+.bi-foot button{background:none;border:0;color:var(--acc);font:inherit;font-size:13.5px;cursor:pointer;padding:4px 2px}
+.bi-dot{color:var(--label-4)}
+.bi-user{margin-top:12px;font-size:12.5px}

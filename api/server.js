@@ -13,6 +13,7 @@ import * as coachConfig from './coach/config.js';
 import * as coachJobs from './coach/jobs.js';
 import { coachRoutes } from './coach/routes.js';
 import { startCadence } from './coach/cadence.js';
+import * as billing from './billing.js';
 
 const PORT = +(process.env.PORT || 3000);
 const DATA = process.env.DATA_DIR || '/data';
@@ -45,10 +46,32 @@ if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(
 const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
 
 const dbFile = path.join(DATA, 'db.json');
-let db = { users: [], creds: [], subs: [], invites: [] };
+let db = { users: [], creds: [], subs: [], invites: [], payments: [], admins: [] };
 try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
 db.subs = db.subs || [];
 db.invites = db.invites || [];
+db.payments = db.payments || [];
+db.admins = db.admins || [];
+// Faturamento: perfis pré-existentes viram isentos (é o dono da instância); novos cadastros
+// começam em trial. Roda no boot a cada start — é idempotente.
+billing.migrateBilling(db);
+saveDb();   // persiste a migração de billing na hora do boot (idempotente, escreve 1× por start)
+
+// Bootstrap do painel admin separado (usuário+senha, cookie próprio). Só cria/atualiza se as
+// duas variáveis vierem no ambiente — o painel pode também ser usado sem credenciais de env
+// criando um admin manualmente no db.json (campo admins).
+if (billing.ADMIN_USERNAME && billing.ADMIN_PASSWORD) {
+  const existing = db.admins.find(a => a.username === billing.ADMIN_USERNAME);
+  if (!existing) {
+    const { salt, hash } = billing.hashPassword(billing.ADMIN_PASSWORD);
+    db.admins.push({ id: crypto.randomBytes(8).toString('base64url'), username: billing.ADMIN_USERNAME, salt, hash, created: new Date().toISOString() });
+    console.log('painel admin: credencial criada para', billing.ADMIN_USERNAME);
+  } else if (!billing.verifyPassword(billing.ADMIN_PASSWORD, existing.salt, existing.hash)) {
+    Object.assign(existing, billing.hashPassword(billing.ADMIN_PASSWORD));
+    console.log('painel admin: senha atualizada para', billing.ADMIN_USERNAME);
+  }
+  saveDb();
+}
 const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
 function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2)); }
 function atomicWrite(file, content) {
@@ -212,6 +235,51 @@ function sessionCookie(user) {
 }
 const clearCookie = `gymsid=; Path=/; Max-Age=0; HttpOnly;${SECURE} SameSite=Lax`;
 
+/* ---------- sessão do painel admin (cookie separado do app) ---------- */
+const PANEL_COOKIE = 'ogadmin';
+function panelCookie(token) {
+  return `${PANEL_COOKIE}=${token}; Path=/; Max-Age=${billing.ADMIN_SESSION_DAYS * 86400}; HttpOnly;${SECURE} SameSite=Lax`;
+}
+const panelClearCookie = `${PANEL_COOKIE}=; Path=/; Max-Age=0; HttpOnly;${SECURE} SameSite=Lax`;
+function readPanelSession(req) {
+  const cookies = Object.fromEntries((req.headers.cookie || '').split(';').map(c => {
+    const i = c.indexOf('='); return i < 0 ? ['', ''] : [c.slice(0, i).trim(), c.slice(i + 1).trim()];
+  }));
+  const t = billing.readPanelToken(cookies[PANEL_COOKIE], SECRET);
+  if (!t) return null;
+  const admin = db.admins.find(a => a.id === t.adminId);
+  if (!admin) return null;
+  if ((admin.pnlSv || 0) !== t.ver) return null;   // logout bumpa a versão — tokens antigos morrem
+  return admin;
+}
+function requirePanel(req, res) {
+  const admin = readPanelSession(req);
+  if (!admin) { json(res, 401, { error: 'sessão do painel expirada' }); return null; }
+  return admin;
+}
+
+/* ---------- gate de assinatura ---------- */
+// Perfis isentos/ativos/em trial passam; vencidos recebem 402 com o resumo do billing.
+function requireAccess(req, res) {
+  const user = readSession(req);
+  if (!user) { json(res, 401, { error: 'not signed in' }); return null; }
+  if (!billing.hasAccess(user)) {
+    json(res, 402, { error: 'subscription required', billing: { ...billing.meBilling(user), pending: !!billing.pendingPayment(db, user.id) } });
+    return null;
+  }
+  return user;
+}
+
+// Rate-limit do login do painel: 10 tentativas por janela de 10 min por chave username+IP.
+const panelAttempts = new Map();
+function panelRateLimited(key) {
+  const now = Date.now();
+  let rec = panelAttempts.get(key);
+  if (!rec || now > rec.reset) { rec = { n: 0, reset: now + 600000 }; panelAttempts.set(key, rec); }
+  rec.n++;
+  return rec.n > 10;
+}
+
 /* ---------- challenge store (in-memory, 5 min TTL) ---------- */
 const challenges = new Map(); // cid -> {challenge, name?, uid?, exp}
 function putChallenge(data) {
@@ -273,13 +341,13 @@ const routes = {
   // the app it was before the feature existed.
   'GET /api/config': async (req, res) => {
     const coach = coachConfig.publicConfig();
-    json(res, 200, { invite_only: INVITE_ONLY, ...(coach ? { coach } : {}) });
+    json(res, 200, { invite_only: INVITE_ONLY, brand: billing.BRAND, billing: billing.publicBilling(), ...(coach ? { coach } : {}) });
   },
 
   'GET /api/me': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } });
+    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user), billing: { ...billing.meBilling(user), pending: !!billing.pendingPayment(db, user.id) } } });
   },
 
   'POST /api/register/options': async (req, res) => {
@@ -326,6 +394,8 @@ const routes = {
     }
     const user = { id: c.uid, name: c.name, created: new Date().toISOString() };
     if (invite) { user.invitedBy = invite.code; invite.usedBy = user.id; invite.usedAt = user.created; }
+    // Todo perfil novo entra em trial — o dono da instância já veio isento pela migração.
+    user.billing = billing.newUserBilling();
     db.users.push(user);
     db.creds.push({
       id: credential.id, userId: user.id,
@@ -334,7 +404,7 @@ const routes = {
       transports: body.credential?.response?.transports || []
     });
     saveDb();
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
+    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user), billing: { ...billing.meBilling(user) } } }, { 'Set-Cookie': sessionCookie(user) });
   },
 
   'POST /api/login/options': async (req, res) => {
@@ -373,7 +443,7 @@ const routes = {
     const user = db.users.find(u => u.id === cred.userId);
     if (!user) return json(res, 500, { error: 'user missing' });
     if (user.disabled) return json(res, 403, { error: 'this account has been disabled' });
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
+    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user), billing: { ...billing.meBilling(user) } } }, { 'Set-Cookie': sessionCookie(user) });
   },
 
   'POST /api/logout': async (req, res) => json(res, 200, { ok: true }, { 'Set-Cookie': clearCookie }),
@@ -391,8 +461,7 @@ const routes = {
   },
 
   'GET /api/data': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
+    const user = requireAccess(req, res); if (!user) return;
     try {
       const state = JSON.parse(fs.readFileSync(stateFile(user.id), 'utf8'));
       json(res, 200, { state });
@@ -400,8 +469,7 @@ const routes = {
   },
 
   'PUT /api/data': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
+    const user = requireAccess(req, res); if (!user) return;
     const body = await readBody(req);
     if (!body.state || typeof body.state !== 'object') return json(res, 400, { error: 'state required' });
     delete body.state.active;              // in-progress workouts stay device-local
@@ -412,8 +480,7 @@ const routes = {
   'GET /api/push/public-key': async (req, res) => json(res, 200, { key: vapid.publicKey }),
 
   'POST /api/push/subscribe': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
+    const user = requireAccess(req, res); if (!user) return;
     const body = await readBody(req);
     const sub = body.subscription;
     if (!sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) return json(res, 400, { error: 'invalid subscription' });
@@ -433,15 +500,13 @@ const routes = {
   },
 
   'POST /api/push/test': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
+    const user = requireAccess(req, res); if (!user) return;
     await sendPush(user.id, { title: 'openGym', body: 'Test notification ✅ — this is what alerts look like.', tag: 'test' });
     json(res, 200, { ok: true });
   },
 
   'POST /api/push/rest-timer': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
+    const user = requireAccess(req, res); if (!user) return;
     const body = await readBody(req);
     const sec = Math.max(1, Math.min(3600, Math.round(+body.seconds || 0)));
     if (!sec) return json(res, 400, { error: 'seconds required' });
@@ -554,6 +619,212 @@ const routes = {
     if (!inv) return json(res, 404, { error: 'no such code' });
     if (inv.usedBy) return json(res, 400, { error: 'already used — cannot revoke' });
     db.invites = db.invites.filter(i => i.code !== inv.code);
+    saveDb();
+    json(res, 200, { ok: true });
+  },
+
+  /* ---------- faturamento (usuário) ---------- */
+  // Status da assinatura do perfil autenticado. Aberto com 401/200 — nunca bloqueado,
+  // é justamente a tela que um vencido precisa ver.
+  'GET /api/billing/status': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    json(res, 200, {
+      billing: { ...billing.meBilling(user), pending: !!billing.pendingPayment(db, user.id) },
+      config: billing.publicBilling()
+    });
+  },
+
+  // Abre uma cobrança mensal. 'mp' (Mercado Pago) devolve um init_point para redirecionar;
+  // 'pix' devolve a chave para pagamento manual — o painel aprova depois de conferir.
+  'POST /api/billing/checkout': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    if (user.disabled) return json(res, 403, { error: 'this account has been disabled' });
+    if (billing.CHECKOUT_METHOD === 'none') return json(res, 503, { error: 'nenhum método de pagamento configurado no servidor' });
+    const existing = billing.pendingPayment(db, user.id);
+    if (existing) return json(res, 200, { payment: existing, ...(existing.initPoint ? { initPoint: existing.initPoint } : {}) });
+    let payment;
+    if (billing.CHECKOUT_METHOD === 'mp') {
+      payment = billing.createPayment(db, user.id, billing.PRICE, 'mp');
+      try {
+        const pref = await billing.mpCreatePreference(billing.MP_TOKEN, {
+          title: `${billing.BRAND} — assinatura mensal`,
+          price: billing.PRICE, currency: billing.CURRENCY,
+          externalReference: payment.id,
+          backUrl: ORIGIN + '/#/billing',
+          notificationUrl: process.env.MP_WEBHOOK_URL || ORIGIN + '/api/billing/webhook'
+        });
+        payment.prefId = pref.id; payment.initPoint = pref.initPoint;
+      } catch (e) {
+        payment.status = 'failed'; payment.error = String(e.message || e).slice(0, 200);
+        saveDb();
+        return json(res, 502, { error: 'falha ao criar cobrança no Mercado Pago' });
+      }
+    } else {
+      payment = billing.createPayment(db, user.id, billing.PRICE, 'pix');
+    }
+    saveDb();
+    json(res, 200, { payment, ...(payment.initPoint ? { initPoint: payment.initPoint } : {}), ...(billing.CHECKOUT_METHOD === 'pix' ? { pix: { key: billing.PIX_KEY, holder: billing.PIX_HOLDER, amount: billing.PRICE, currency: billing.CURRENCY } } : {}) });
+  },
+
+  // Webhook do Mercado Pago. O corpo nunca é confiado de olhos fechados: buscamos o
+  // pagamento na própria API do MP com o token do servidor e só aprovamos se ele
+  // disser 'approved' E o external_reference bater com uma cobrança pend nossa.
+  'POST /api/billing/webhook': async (req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const body = await readBody(req).catch(() => ({}));
+    const mpPaymentId = body?.data?.id || url.searchParams.get('data.id') || url.searchParams.get('id');
+    if (!billing.MP_TOKEN || !mpPaymentId) return json(res, 200, { ok: true });   // 200 para o MP parar de reenviar
+    try {
+      const mp = await billing.mpFetchPayment(billing.MP_TOKEN, mpPaymentId);
+      if (mp.status !== 'approved' || !mp.external_reference) return json(res, 200, { ok: true, ignored: mp.status });
+      const local = (db.payments || []).find(p => p.id === mp.external_reference);
+      if (!local || local.status !== 'pending') return json(res, 200, { ok: true, ignored: 'no pending payment' });
+      local.mpPaymentId = String(mp.id);
+      local.paidAmount = mp.transaction_amount;
+      const u = billing.approvePayment(db, local.id, { by: 'mercadopago' });
+      saveDb();
+      if (u) sendPush(u.id, { title: `${billing.BRAND}`, body: 'Pagamento aprovado — bom treino! 💪', tag: 'billing' });
+      json(res, 200, { ok: true });
+    } catch (e) {
+      console.error('billing webhook', e);
+      json(res, 500, { error: 'webhook error' });
+    }
+  },
+
+  /* ---------- painel admin (autenticação dedicada, separada do app) ---------- */
+  'POST /api/panel/login': async (req, res) => {
+    const body = await readBody(req);
+    const username = String(body.username || '').trim();
+    const ip = req.socket?.remoteAddress || '?';
+    const key = billing.attemptsKey(ip, username);
+    if (panelRateLimited(key)) return json(res, 429, { error: 'muitas tentativas — aguarde alguns minutos' });
+    if (!db.admins.length) return json(res, 403, { error: 'painel não configurado — defina ADMIN_USERNAME e ADMIN_PASSWORD no ambiente' });
+    const admin = db.admins.find(a => a.username === username);
+    if (!admin || !billing.verifyPassword(String(body.password || ''), admin.salt, admin.hash))
+      return json(res, 401, { error: 'usuário ou senha incorretos' });
+    panelAttempts.delete(key);
+    json(res, 200, { ok: true, username: admin.username }, { 'Set-Cookie': panelCookie(billing.makePanelToken(admin.id, SECRET, undefined, Date.now(), admin.pnlSv || 0)) });
+  },
+
+  // Logout do painel bumpa a versão do admin: todo token emitido antes deixa de verificar,
+  // mesmo que uma cópia do cookie tenha escapado.
+  'POST /api/panel/logout': async (req, res) => {
+    const admin = readPanelSession(req);
+    if (admin) { admin.pnlSv = (admin.pnlSv || 0) + 1; saveDb(); }
+    json(res, 200, { ok: true }, { 'Set-Cookie': panelClearCookie });
+  },
+
+  'GET /api/panel/me': async (req, res) => {
+    const admin = requirePanel(req, res); if (!admin) return;
+    json(res, 200, { username: admin.username });
+  },
+
+  // Visão geral: contagens por status + receita dos últimos 30 dias.
+  'GET /api/panel/overview': async (req, res) => {
+    const admin = requirePanel(req, res); if (!admin) return;
+    const now = Date.now();
+    const by = { free: 0, active: 0, trial: 0, overdue: 0 };
+    let disabled = 0;
+    for (const u of db.users) {
+      if (u.disabled) disabled++;
+      by[billing.billingStatus(u, now).code]++;
+    }
+    const since = now - 30 * 86400000;
+    const rev30 = (db.payments || [])
+      .filter(p => p.status === 'approved' && p.approvedAt && +new Date(p.approvedAt) >= since)
+      .reduce((s, p) => s + (+p.amount || 0), 0);
+    json(res, 200, {
+      users: db.users.length, disabled, by,
+      mrr: by.active * billing.PRICE,
+      revenue30: Math.round(rev30 * 100) / 100,
+      pendingPayments: (db.payments || []).filter(p => p.status === 'pending').length,
+      price: billing.PRICE, currency: billing.CURRENCY, brand: billing.BRAND, trialDays: billing.TRIAL_DAYS,
+      now
+    });
+  },
+
+  'GET /api/panel/users': async (req, res) => {
+    const admin = requirePanel(req, res); if (!admin) return;
+    const now = Date.now();
+    const users = db.users.map(u => {
+      const S = readState(u.id) || {};
+      const workouts = S.workouts || [];
+      const pend = billing.pendingPayment(db, u.id);
+      return {
+        id: u.id, name: u.name, created: u.created || null, disabled: !!u.disabled,
+        billing: { ...billing.billingStatus(u, now), status2: u.billing?.status || null, note: u.billing?.note || null, pendingId: pend ? pend.id : null, pendingMethod: pend ? pend.method : null },
+        workouts: workouts.length,
+        lastWorkout: workouts.length ? workouts[workouts.length - 1].d : null,
+        lastSync: S._ts || null
+      };
+    });
+    json(res, 200, { users, now });
+  },
+
+  'GET /api/panel/payments': async (req, res) => {
+    const admin = requirePanel(req, res); if (!admin) return;
+    const payments = (db.payments || []).slice().reverse().map(p => ({
+      ...p, userName: (db.users.find(u => u.id === p.userId) || {}).name || '(perfil removido)'
+    }));
+    json(res, 200, { payments });
+  },
+
+  'POST /api/panel/user/free': async (req, res) => {
+    const admin = requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    billing.grantFree(u, !!body.free, body.free ? 'isento pelo painel' : null);
+    saveDb();
+    json(res, 200, { ok: true, id: u.id, free: !!body.free, billing: billing.billingStatus(u) });
+  },
+
+  'POST /api/panel/user/disable': async (req, res) => {
+    const admin = requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    u.disabled = !!body.disabled;
+    if (u.disabled) presence.delete(u.id);
+    saveDb();
+    json(res, 200, { ok: true, id: u.id, disabled: u.disabled });
+  },
+
+  // Cortesia manual: estende o período pago em N dias (não afeta isentos).
+  'POST /api/panel/user/extend': async (req, res) => {
+    const admin = requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    const days = Math.max(1, Math.min(365, Math.round(+body.days || 0)));
+    if (!days) return json(res, 400, { error: 'days required' });
+    const b = u.billing = u.billing || billing.newUserBilling(0);
+    if (b.free) return json(res, 400, { error: 'perfil isento — remova a isenção antes de estender' });
+    const now = Date.now();
+    const base = b.periodEnd && +new Date(b.periodEnd) > now ? +new Date(b.periodEnd) : now;
+    b.status = 'active';
+    b.periodEnd = new Date(base + days * 86400000).toISOString();
+    saveDb();
+    json(res, 200, { ok: true, billing: billing.billingStatus(u) });
+  },
+
+  'POST /api/panel/payment/approve': async (req, res) => {
+    const admin = requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = billing.approvePayment(db, String(body.id || ''), { by: admin.username });
+    if (!u) return json(res, 404, { error: 'cobrança pendente não encontrada' });
+    saveDb();
+    sendPush(u.id, { title: `${billing.BRAND}`, body: 'Pagamento aprovado — bom treino! 💪', tag: 'billing' });
+    json(res, 200, { ok: true, billing: billing.billingStatus(u) });
+  },
+
+  'POST /api/panel/payment/reject': async (req, res) => {
+    const admin = requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const p = billing.rejectPayment(db, String(body.id || ''), { by: admin.username });
+    if (!p) return json(res, 404, { error: 'cobrança pendente não encontrada' });
     saveDb();
     json(res, 200, { ok: true });
   },
