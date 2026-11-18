@@ -35,7 +35,7 @@ const FEATURES = [
 
 const FAQ = [
   { q: 'Preciso de cartão de crédito para testar?', a: 'Não. Crie seu perfil e use tudo por 7 dias grátis. Só depois, se gostar, assina o mensal — sem fidelidade e sem cobrança automática surpresa.' },
-  { q: 'Como funciona o pagamento?', a: 'Assinatura mensal de R$ 14,90 por Pix (confirmação em minutos) ou cartão via Mercado Pago, conforme a configuração do serviço. Você paga mês a mês; para parar, basta não renovar.' },
+  { q: 'Como funciona o pagamento?', a: 'Assinatura mensal de R$ 14,90 — pague com Pix (liberação em segundos) ou cartão de crédito, PicPay, Google Pay ou Apple Pay no checkout seguro da Cakto. Você paga mês a mês; para parar, basta não renovar.' },
   { q: 'Funciona no celular?', a: 'Sim — abra no navegador e instale como aplicativo (adicionar à tela de início). Ele continua funcionando dentro do ginásio, inclusive com a tela ligada durante o treino.' },
   { q: 'Onde ficam meus dados?', a: 'No servidor do serviço, vinculados apenas ao seu perfil. Nada é vendido nem compartilhado. Você pode exportar tudo em JSON nas configurações a qualquer momento e pedir a exclusão do perfil quando quiser.' },
   { q: 'Já uso outro app de treino. Dá para trazer meu histórico?', a: 'Dá. O app importa treinos do FitNotes, Strong e Hevy (com o RPE registrado) e o peso corporal direto de uma exportação do Apple Health.' },
@@ -145,7 +145,7 @@ export default function Landing() {
               <li><Icon name="check" /> Cancele quando quiser, sem multa</li>
             </ul>
             <Button variant="primary" size="lg" icon="bolt" onClick={() => navigate('/entrar')}>Criar meu perfil agora</Button>
-            <div className="lg-price-note">Pagamento por Pix ou cartão · sem fidelidade</div>
+            <div className="lg-price-note">Pix na hora, cartão ou PicPay · sem fidelidade</div>
           </div>
         </div>
       </section>

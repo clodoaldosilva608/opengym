@@ -341,10 +341,161 @@ async function run3() {
   }
 }
 
+
+/* ---------- run 4: painel completo — CRUD, settings, checkout hospedado, callback ---------- */
+async function run4() {
+  console.log('\n— Run 4: painel completo — CRUD de usuários, configurações, checkout hospedado —');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ogsmoke4-'));
+  const past = new Date(Date.now() - 3 * 86400000).toISOString();
+  tempDb(dir, { users: [{ id: 'u4', name: 'Ana CRUD', created: past, billing: { status: 'trial', free: false, trialEndsAt: past, periodEnd: null } }], creds: [], subs: [], invites: [] });
+  const WHSEC = 'whsec-test-0000';
+  const mock = await mockCakto(3317);
+  const child = spawn('node', ['scripts/dev-serverless.mjs'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PORT: String(3318), DATA_BACKEND: 'fs', DATA_DIR: dir,
+      RP_ID: 'localhost', ORIGIN: `http://localhost:3318`,
+      ADMIN_USERNAME: 'dono', ADMIN_PASSWORD: 'senhaforte123',
+      TRIAL_DAYS: '7', PRICE_MONTHLY: '14.90', APP_BRAND: 'openGym',
+      VAPID_SUBJECT: 'mailto:smoke@teste',
+      CAKTO_CLIENT_ID: 'cid-teste', CAKTO_CLIENT_SECRET: 'csec-teste', CAKTO_OFFER_ID: 'cvgtest',
+      CAKTO_WEBHOOK_SECRET: WHSEC, CAKTO_BASE_URL: 'http://127.0.0.1:3317/'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  child.stderr.on('data', d => process.env.SMOKE_DEBUG && process.stderr.write(d));
+  const base = 'http://localhost:3318';
+  try {
+    await waitHealth(3318);
+    const login = await fetch(base + '/api/panel/login', { method: 'POST', headers: J, body: JSON.stringify({ username: 'dono', password: 'senhaforte123' }) });
+    const pcookie = (login.headers.get('set-cookie') || '').split(';')[0];
+    const pc = { cookie: pcookie };
+    const cookie = sessionCookie(dir, 'u4');
+
+    /* settings: preço/trial/marca/métodos editáveis no ar */
+    const st0 = await (await fetch(base + '/api/panel/settings', { headers: pc })).json();
+    ok(st0.settings.price === 14.9 && st0.settings.brand === 'openGym', `settings iniciais: preço ${st0.settings.price}`);
+    ok(st0.integration.cakto === true && !!st0.integration.hostedUrl, 'integração Cakto visível + checkout hospedado');
+    const bad = await fetch(base + '/api/panel/settings', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ price: -5 }) });
+    ok(bad.status === 400, 'settings: preço inválido → 400');
+    const st1 = await (await fetch(base + '/api/panel/settings', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ price: 19.9, brand: 'MeuGym', trialDays: 3, pixKey: 'dono@pix.com', pixHolder: 'Dono' }) })).json();
+    ok(st1.settings.price === 19.9 && st1.settings.brand === 'MeuGym' && st1.settings.trialDays === 3, `settings salvos: preço ${st1.settings.price}, brand ${st1.settings.brand}, trial ${st1.settings.trialDays}`);
+    const cfg1 = await (await fetch(base + '/api/config')).json();
+    ok(cfg1.billing.price === 19.9 && cfg1.brand === 'MeuGym' && cfg1.billing.trialDays === 3, `/api/config reflete as configurações no ar (${cfg1.billing.price}/${cfg1.brand})`);
+    ok(cfg1.billing.methods.pix === true && cfg1.billing.methods.checkout === true && cfg1.billing.checkoutUrl, 'métodos expostos na config pública (pix + checkout)');
+    // desligar Pix → só checkout disponível
+    const st2 = await (await fetch(base + '/api/panel/settings', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ methods: { pix: false, checkout: true } }) })).json();
+    const cfg2 = await (await fetch(base + '/api/config')).json();
+    ok(cfg2.billing.methods.pix === false && cfg2.billing.methods.checkout === true, 'meio Pix desligado no painel desaparece da config');
+    const cPix = await fetch(base + '/api/billing/checkout', { method: 'POST', headers: { ...J, cookie }, body: '{}' });
+    ok(cPix.status === 400, 'checkout pix desligado → 400');
+    await (await fetch(base + '/api/panel/settings', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ methods: { pix: true, checkout: true }, price: 14.9, brand: 'openGym' }) }));
+
+    /* checkout hospedado: cria registro com callback = userId */
+    const ckH = await (await fetch(base + '/api/billing/checkout', { method: 'POST', headers: { ...J, cookie }, body: JSON.stringify({ method: 'checkout' }) })).json();
+    ok(ckH.payment?.method === 'cakto-checkout', `checkout hospedado: ${ckH.payment?.method}`);
+    ok((ckH.payment?.checkoutUrl || '').startsWith('https://pay.cakto.com.br/cvgtest?callback=u4'), `checkoutUrl com callback do perfil: ${ckH.payment?.checkoutUrl}`);
+    // idempotente
+    const ckH2 = await (await fetch(base + '/api/billing/checkout', { method: 'POST', headers: { ...J, cookie }, body: JSON.stringify({ method: 'checkout' }) })).json();
+    ok(ckH2.payment?.id === ckH.payment.id, 'checkout hospedado é idempotente');
+
+    /* webhook de compra no checkout hospedado concilia pelo callback */
+    const whCard = { secret: WHSEC, event: 'purchase_approved', data: { id: 'mock-card-1', refId: 'MOCKCARD1', status: 'paid', amount: 14.9, callback: 'u4', paymentMethod: 'credit_card', paymentMethodName: 'Cartão de Crédito', customer: { name: 'Ana CRUD', email: 'ana@teste.com' }, product: {}, offer: {} } };
+    const wh = signedWebhookHeaders(WHSEC, whCard);
+    const wR = await fetch(base + '/api/billing/webhook', { method: 'POST', headers: wh.headers, body: wh.raw });
+    const wRj = await wR.json();
+    ok(wRj.outcome === 'approved', `webhook cartão conciliado pelo callback → ${wRj.outcome}`);
+    const me1 = await (await fetch(base + '/api/me', { headers: { cookie } })).json();
+    ok(me1.user?.billing?.code === 'active', 'compra no cartão liberou o acesso automaticamente');
+
+    /* CRUD de usuários */
+    const det0 = await (await fetch(base + '/api/panel/user?id=u4', { headers: pc })).json();
+    ok(det0.user?.name === 'Ana CRUD' && det0.user?.email === 'ana@teste.com' && det0.stats.workouts === 0, 'painel/user: detalhe completo');
+    const rn = await (await fetch(base + '/api/panel/user/rename', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ id: 'u4', name: 'Ana Renomeada' }) })).json();
+    ok(rn.name === 'Ana Renomeada', 'painel/user/rename');
+    // PUT de dados p/ ter estatísticas e depois wipe
+    await fetch(base + '/api/data', { method: 'PUT', headers: { ...J, cookie }, body: JSON.stringify({ state: { unit: 'kg', workouts: [{ id: 'w1', d: '2026-11-01' }], routines: [{ id: 'r1', name: 'Full body' }] } }) });
+    const det1 = await (await fetch(base + '/api/panel/user?id=u4', { headers: pc })).json();
+    ok(det1.stats.workouts === 1 && det1.stats.routines === 1, 'estatísticas de treino aparecem no detalhe');
+    const wipe = await (await fetch(base + '/api/panel/user/wipe-data', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ id: 'u4' }) })).json();
+    ok(wipe.ok === true, 'painel/user/wipe-data');
+    const det2 = await (await fetch(base + '/api/panel/user?id=u4', { headers: pc })).json();
+    ok(det2.stats.workouts === 0, 'dados de treino zerados após wipe');
+    // período explícito
+    const per = await (await fetch(base + '/api/panel/user/period', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ id: 'u4', status: 'active', periodEnd: new Date(Date.now() + 10 * 86400000).toISOString() }) })).json();
+    ok(per.billing?.code === 'active', 'painel/user/period: define data de acesso');
+    // reiniciar trial
+    const rt = await (await fetch(base + '/api/panel/user/reset-trial', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ id: 'u4', days: 5 }) })).json();
+    ok(rt.billing?.code === 'trial', 'painel/user/reset-trial: trial de volta');
+    // nota interna
+    const nt = await (await fetch(base + '/api/panel/user/note', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ id: 'u4', note: 'aluna top' }) })).json();
+    ok(nt.note === 'aluna top', 'painel/user/note');
+    // encerrar sessões: cookie antigo morra
+    await fetch(base + '/api/panel/user/logout-all', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ id: 'u4' }) });
+    const meOut = await fetch(base + '/api/me', { headers: { cookie } });
+    ok(meOut.status === 401, 'logout-all encerra a sessão do usuário (sv incrementado)');
+    const cookie2 = sessionCookie(dir, 'u4');   // sv voltou a 0 no cookie novo, mas o usuário está em sv=1...
+    const meOut2 = await fetch(base + '/api/me', { headers: { cookie: cookie2 } });
+    ok(meOut2.status === 401, 'sessão forjada com sv antigo também morre');
+
+    /* convites + cadastro só por convite */
+    const inv = await (await fetch(base + '/api/panel/invites/new', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ note: 'teste' }) })).json();
+    ok(!!inv.invite?.code, 'painel/invites/new gera código');
+    await fetch(base + '/api/panel/settings', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ inviteOnly: true }) });
+    const cfg3 = await (await fetch(base + '/api/config')).json();
+    ok(cfg3.invite_only === true, 'invite_only ligado no painel reflete na config');
+    const regNo = await fetch(base + '/api/register/options', { method: 'POST', headers: J, body: JSON.stringify({ name: 'X' }) });
+    ok(regNo.status === 403, 'cadastro sem convite → 403');
+    const regOpt = await fetch(base + '/api/register/options', { method: 'POST', headers: J, body: JSON.stringify({ name: 'Convidado', code: inv.invite.code }) });
+    ok(regOpt.status === 200, 'cadastro com código de convite passa');
+    const invL = await (await fetch(base + '/api/panel/invites', { headers: pc })).json();
+    ok(invL.invites.length === 1 && invL.invite_only === true, 'painel/invites lista');
+    await fetch(base + '/api/panel/settings', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ inviteOnly: false }) });
+
+    /* pagamentos: apagar registro; broadcast sem subs; tick; backup */
+    const pays = await (await fetch(base + '/api/panel/payments', { headers: pc })).json();
+    ok(pays.payments.length >= 1, `histórico de pagamentos: ${pays.payments.length} registro(s)`);
+    const del1 = await fetch(base + '/api/panel/payment/delete', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ id: 'inexistente' }) });
+    ok(del1.status === 404, 'payment/delete: id inexistente → 404');
+    const del2 = await (await fetch(base + '/api/panel/payment/delete', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ id: pays.payments[0].id }) })).json();
+    ok(del2.ok === true, 'payment/delete apaga registro');
+    const bc = await (await fetch(base + '/api/panel/broadcast', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ title: 'Aviso', body: 'Treino novo no ar' }) })).json();
+    ok(bc.ok === true && bc.sent === 0, `broadcast sem inscritos: sent=${bc.sent}`);
+    const bcBad = await fetch(base + '/api/panel/broadcast', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ title: '', body: 'x' }) });
+    ok(bcBad.status === 400, 'broadcast sem título → 400');
+    const tk = await (await fetch(base + '/api/panel/tick', { method: 'POST', headers: { ...J, cookie: pcookie }, body: '{}' })).json();
+    ok(tk.ok === true, 'painel/tick roda');
+    const bk = await fetch(base + '/api/panel/backup', { headers: pc });
+    ok(bk.status === 200 && (bk.headers.get('content-disposition') || '').includes('opengym-backup'), 'backup baixa com header de anexo');
+    const bkJson = await bk.json();
+    ok(bkJson.db?.users?.length === 1, 'backup contém o db');
+
+    /* overview enriquecido */
+    const ov = await (await fetch(base + '/api/panel/overview', { headers: pc })).json();
+    ok(ov.newUsers30 === 1 && typeof ov.revenueTotal === 'number' && ov.integration?.cakto === true, 'overview: novos usuários, receita total, integração');
+
+    /* excluir usuário: exige confirm == nome */
+    const delNo = await fetch(base + '/api/panel/user/delete', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ id: 'u4', confirm: 'errado' }) });
+    ok(delNo.status === 400, 'user/delete sem confirmação correta → 400');
+    const detN = await (await fetch(base + '/api/panel/user?id=u4', { headers: pc })).json();
+    const delOk = await (await fetch(base + '/api/panel/user/delete', { method: 'POST', headers: { ...J, cookie: pcookie }, body: JSON.stringify({ id: 'u4', confirm: detN.user.name }) })).json();
+    ok(delOk.ok === true, 'user/delete com confirmação correta');
+    const meDel = await fetch(base + '/api/me', { headers: { cookie: sessionCookie(dir, 'u4') } });
+    ok(meDel.status === 401, 'usuário excluído → sessão morta');
+    const ovDel = await (await fetch(base + '/api/panel/overview', { headers: pc })).json();
+    ok(ovDel.users === 0, 'overview reflete a exclusão');
+  } finally {
+    child.kill('SIGKILL');
+    mock.close();
+  }
+}
+
 try {
   await run1();
   await run2();
   await run3();
+  await run4();
 } catch (e) {
   console.error('ERRO:', e.message);
   failures++;

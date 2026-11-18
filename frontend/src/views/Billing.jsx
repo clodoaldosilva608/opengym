@@ -1,10 +1,13 @@
 /* Tela de assinatura — gate quando o perfil está vencido (trial acabou ou a
    mensalidade parou) e página "minha assinatura" nos demais estados, pela rota
-   /billing dentro do app. Fluxos:
-     'cakto' — Cakto: coleta e-mail/telefone/CPF, gera Pix (QR copia-e-cola) na
-               hora e libera o acesso automaticamente pelo webhook do Cakto.
-     'pix'   — manual: mostra a chave Pix, o usuário avisa, o admin aprova.
-     'mp'    — Mercado Pago (redirect).                                       */
+   /billing dentro do app. Fluxos (meios escolhidos no painel admin):
+     'cakto' + pix      — QR copia-e-cola gerado na hora; webhook do Cakto
+                          libera o acesso automaticamente.
+     'cakto' + checkout — checkout hospedado da Cakto (pay.cakto.com.br): cartão
+                          de crédito, PicPay, Google Pay, Apple Pay; o callback
+                          (id do perfil) volta no webhook e aprova sozinho.
+     'pix'              — manual: mostra a chave Pix, o admin aprova.
+     'mp'               — Mercado Pago (redirect).                            */
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import QRCode from 'qrcode'
@@ -43,20 +46,29 @@ export default function Billing() {
   const { user, billing, config, refreshBilling, setUser } = useStore()
   const toast = m => useUI.getState().toast(m)
 
-  const [cfg, setCfg] = useState({ brand: 'openGym', price: 14.9, currency: 'BRL', trialDays: 7, method: 'pix', pix: null })
+  const [cfg, setCfg] = useState({ brand: 'openGym', price: 14.9, currency: 'BRL', trialDays: 7, method: 'pix', methods: {}, checkoutUrl: null, pix: null })
   const [payment, setPayment] = useState(null)      // cobrança pendente aberta
   const [qrImg, setQrImg] = useState('')            // QR renderizado localmente
   const [form, setForm] = useState({ email: '', phone: '', docNumber: '' })
+  const [methodSel, setMethodSel] = useState('pix') // meio escolhido (cakto: pix | checkout)
   const [showPay, setShowPay] = useState(false)     // abrir formulário nos estados positivos
   const [busy, setBusy] = useState(false)
   const [checking, setChecking] = useState(false)
 
   useEffect(() => {
     const c = config?.billing
-    if (c) setCfg({ brand: c.brand || 'openGym', price: c.price || 14.9, currency: c.currency || 'BRL', trialDays: c.trialDays ?? 7, method: c.method || 'none', pix: c.pix || null })
+    if (c) {
+      setCfg({
+        brand: c.brand || 'openGym', price: c.price || 14.9, currency: c.currency || 'BRL',
+        trialDays: c.trialDays ?? 7, method: c.method || 'none',
+        methods: c.methods || {}, checkoutUrl: c.checkoutUrl || null, pix: c.pix || null
+      })
+      const m = c.methods || {}
+      setMethodSel(m.pix ? 'pix' : 'checkout')
+    }
   }, [config])
 
-  // Restaurar cobrança pendente (QR do Pix) depois de recarregar a página.
+  // Restaurar cobrança pendente (QR do Pix ou checkout aberto) depois de recarregar.
   useEffect(() => {
     if (billing?.pending) {
       api('/api/billing/pending').then(r => { if (r.payment) setPayment(r.payment) }).catch(() => {})
@@ -84,18 +96,27 @@ export default function Billing() {
   const code = billing?.code || 'overdue'
   const preco = fmt(cfg.price, cfg.currency)
   const qrExpired = !!(payment?.qrExpiresAt && +new Date(payment.qrExpiresAt) < Date.now())
+  const mPix = cfg.method === 'cakto' ? !!cfg.methods?.pix : cfg.method === 'pix'
+  const mCheckout = cfg.method === 'cakto' && !!cfg.methods?.checkout
+  const bothCakto = mPix && mCheckout
 
   const checkout = async ev => {
     ev?.preventDefault?.()
     setBusy(true)
     try {
       const body = cfg.method === 'cakto'
-        ? { email: form.email.trim(), phone: form.phone, docNumber: form.docNumber }
+        ? (methodSel === 'checkout' || !mPix)
+          ? { method: 'checkout' }
+          : { email: form.email.trim(), phone: form.phone, docNumber: form.docNumber }
         : {}
       const r = await api('/api/billing/checkout', { method: 'POST', body: JSON.stringify(body) })
       if (r.initPoint) { window.location.href = r.initPoint; return }
       setPayment(r.payment)
       setShowPay(false)
+      if (r.payment?.method === 'cakto-checkout' && r.payment?.checkoutUrl) {
+        window.location.href = r.payment.checkoutUrl       // leva o aluno à Cakto
+        return
+      }
       if (r.payment?.qrCode) toast('Pix gerado — escaneie o QR ou copie o código')
       else if (r.payment) toast('Cobrança aberta — aguarde a confirmação')
     } catch (e) { toast(e.message || 'Não foi possível abrir a cobrança') }
@@ -125,42 +146,7 @@ export default function Billing() {
   /* ---------- seção de pagamento (compartilhada pelos estados) ---------- */
   const paySection = cfg.method === 'cakto' && (
     <>
-      {!payment && (showPay || code === 'overdue') && (
-        <form className="bi-pix" onSubmit={checkout}>
-          <div className="bi-pix-hint">
-            {code === 'overdue'
-              ? 'Preencha os dados do pagador — o Pix é gerado na hora e seu acesso é liberado automaticamente após o pagamento:'
-              : 'Preencha os dados do pagador para gerar o Pix da próxima mensalidade:'}
-          </div>
-          <label className="bi-field">
-            <span>E-mail (recebe o comprovante)</span>
-            <input type="email" inputMode="email" autoComplete="email" placeholder="voce@email.com"
-              value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} required />
-          </label>
-          <label className="bi-field">
-            <span>Telefone (WhatsApp do pagador)</span>
-            <input type="tel" inputMode="tel" autoComplete="tel" placeholder="(11) 91234-5678"
-              value={form.phone} onChange={e => setForm({ ...form, phone: maskPhone(e.target.value) })} required />
-          </label>
-          <label className="bi-field">
-            <span>CPF do pagador</span>
-            <input inputMode="numeric" autoComplete="off" placeholder="000.000.000-00"
-              value={form.docNumber} onChange={e => setForm({ ...form, docNumber: maskCPF(e.target.value) })} required={code === 'overdue' || !docReady} />
-          </label>
-          <Button variant="primary" size="lg" icon="bolt" disabled={busy}>
-            {busy ? 'Gerando Pix…' : `Gerar Pix (${preco})`}
-          </Button>
-          <div className="bi-hint">O acesso é liberado automaticamente segundos depois de pagar — sem esperar aprovação manual.</div>
-        </form>
-      )}
-
-      {!payment && !(showPay || code === 'overdue') && (
-        <Button variant="primary" size="lg" icon="bolt" onClick={() => setShowPay(true)}>
-          Assinar agora ({preco}/mês)
-        </Button>
-      )}
-
-      {payment && (
+      {payment?.qrCode && (
         <div className="bi-qrcode">
           <div className="bi-qrcode-head">
             <strong>Pix gerado — {fmt(payment.amount, payment.currency)}</strong>
@@ -176,18 +162,91 @@ export default function Billing() {
           <div className="bi-brcode">{payment.qrCode || '—'}</div>
           <div className="bi-qrcode-actions">
             <Button size="sm" icon="clipboard" onClick={copyPix}>Copiar código Pix</Button>
-            {payment.checkoutUrl && (
-              <a className="bi-checkout-link" href={payment.checkoutUrl} target="_blank" rel="noreferrer">
-                Pagar no checkout Cakto (cartão)
-              </a>
-            )}
           </div>
           <Button variant="primary" size="lg" icon="reset" disabled={checking} onClick={check}>
             {checking ? 'Verificando…' : 'Já paguei — verificar acesso'}
           </Button>
           <div className="bi-hint">Assim que o pagamento cair, o acesso é liberado automaticamente (normalmente em segundos).</div>
+          {bothCakto && <button className="bi-regen" onClick={() => { setPayment(null); setMethodSel('checkout') }}>Prefiro pagar com cartão ou outro meio</button>}
           <button className="bi-regen" onClick={checkout} disabled={busy}>Gerar novo Pix</button>
         </div>
+      )}
+
+      {payment && payment.method === 'cakto-checkout' && (
+        <div className="bi-pending">
+          <div className="bi-pending-ic"><Icon name="globe" /></div>
+          <strong>Checkout da Cakto aberto — {fmt(payment.amount, payment.currency)}</strong>
+          <p>Finalize o pagamento na página segura da Cakto com <strong>cartão de crédito, PicPay, Google Pay ou Apple Pay</strong>. Aprovado o pagamento, seu acesso é liberado automaticamente aqui — sem esperar nada.</p>
+          {payment.checkoutUrl && (
+            <a className="bi-checkout-link" href={payment.checkoutUrl}>Abrir checkout da Cakto</a>
+          )}
+          <Button variant="primary" size="lg" icon="reset" disabled={checking} onClick={check}>
+            {checking ? 'Verificando…' : 'Já paguei — verificar acesso'}
+          </Button>
+          <div className="bi-hint">A conferência é automática — em geral libera em segundos depois do pagamento.</div>
+          <button className="bi-regen" onClick={() => { setPayment(null); setMethodSel('pix') }}>Prefiro pagar com Pix</button>
+        </div>
+      )}
+
+      {!payment && (showPay || code === 'overdue') && (
+        <div className="bi-pix">
+          {bothCakto && (
+            <div className="bi-methods">
+              <button type="button" className={`bi-method${methodSel === 'pix' ? ' on' : ''}`} onClick={() => setMethodSel('pix')}>
+                <strong>Pix</strong>
+                <span>QR na hora · aprovação automática</span>
+              </button>
+              <button type="button" className={`bi-method${methodSel === 'checkout' ? ' on' : ''}`} onClick={() => setMethodSel('checkout')}>
+                <strong>Cartão e outros</strong>
+                <span>crédito · PicPay · Google Pay · Apple Pay</span>
+              </button>
+            </div>
+          )}
+          {!bothCakto && mCheckout && (
+            <div className="bi-pix-hint">Pagamento pelo checkout seguro da Cakto — cartão de crédito, PicPay, Google Pay ou Apple Pay:</div>
+          )}
+          {methodSel === 'pix' && mPix ? (
+            <form onSubmit={checkout}>
+              <div className="bi-pix-hint">
+                {code === 'overdue'
+                  ? 'Preencha os dados do pagador — o Pix é gerado na hora e seu acesso é liberado automaticamente após o pagamento:'
+                  : 'Preencha os dados do pagador para gerar o Pix da próxima mensalidade:'}
+              </div>
+              <label className="bi-field">
+                <span>E-mail (recebe o comprovante)</span>
+                <input type="email" inputMode="email" autoComplete="email" placeholder="voce@email.com"
+                  value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} required />
+              </label>
+              <label className="bi-field">
+                <span>Telefone (WhatsApp do pagador)</span>
+                <input type="tel" inputMode="tel" autoComplete="tel" placeholder="(11) 91234-5678"
+                  value={form.phone} onChange={e => setForm({ ...form, phone: maskPhone(e.target.value) })} required />
+              </label>
+              <label className="bi-field">
+                <span>CPF do pagador</span>
+                <input inputMode="numeric" autoComplete="off" placeholder="000.000.000-00"
+                  value={form.docNumber} onChange={e => setForm({ ...form, docNumber: maskCPF(e.target.value) })} required={code === 'overdue' || !docReady} />
+              </label>
+              <Button variant="primary" size="lg" icon="bolt" disabled={busy}>
+                {busy ? 'Gerando Pix…' : `Gerar Pix (${preco})`}
+              </Button>
+              <div className="bi-hint">O acesso é liberado automaticamente segundos depois de pagar — sem esperar aprovação manual.</div>
+            </form>
+          ) : (
+            <>
+              <Button variant="primary" size="lg" icon="bolt" disabled={busy} onClick={checkout}>
+                {busy ? 'Abrindo checkout…' : `Assinar agora (${preco}/mês)`}
+              </Button>
+              <div className="bi-hint">Você irá para a página segura da Cakto e paga com cartão de crédito, PicPay, Google Pay ou Apple Pay. Ao aprovar, o acesso é liberado automaticamente.</div>
+            </>
+          )}
+        </div>
+      )}
+
+      {!payment && !(showPay || code === 'overdue') && (
+        <Button variant="primary" size="lg" icon="bolt" onClick={() => setShowPay(true)}>
+          Assinar agora ({preco}/mês)
+        </Button>
       )}
     </>
   )

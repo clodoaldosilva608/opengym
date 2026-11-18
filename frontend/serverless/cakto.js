@@ -22,6 +22,19 @@ export function offerId() { return env('CAKTO_OFFER_ID'); }
 export function isConfigured() { return !!(env('CAKTO_CLIENT_ID') && env('CAKTO_CLIENT_SECRET') && offerId()); }
 export function hasWebhookSecret() { return !!env('CAKTO_WEBHOOK_SECRET'); }
 
+/* Checkout hospedado da oferta — página da Cakto que aceita todos os meios
+   habilitados no produto (cartão, PicPay, Google Pay, Apple Pay, card+pix…).
+   Docs: o link público é https://pay.cakto.com.br/{id_da_oferta}. O parâmetro
+   `callback` (identificador opaco nosso) volta no webhook purchase_approved
+   para conciliar compras feitas nesse checkout. CAKTO_CHECKOUT_URL sobrescreve
+   (útil para mocks de teste). */
+export function hostedCheckoutUrl() {
+  const custom = env('CAKTO_CHECKOUT_URL');
+  if (custom) return String(custom).replace(/\/?$/, '');
+  const o = offerId();
+  return o ? 'https://pay.cakto.com.br/' + encodeURIComponent(o) : null;
+}
+
 /* ------------------------------ OAuth2 ------------------------------ */
 /* Token em memória por instância; renova 5 min antes de expirar. Não existe
    refresh token na doc — pedimos um novo quando perto do fim da vida. */

@@ -92,3 +92,17 @@
 .bi-checkout-link{color:var(--acc);font-size:13px;text-decoration:none;border-bottom:1px dashed color-mix(in srgb,var(--acc) 45%,transparent);padding-bottom:1px}
 .bi-regen{background:none;border:0;color:var(--label-3);font:inherit;font-size:12.5px;cursor:pointer;margin-top:10px;padding:4px 2px;text-decoration:underline;text-underline-offset:3px}
 .bi-regen:disabled{opacity:.5;cursor:default}
+
+/* ---------- seletor de meio de pagamento (Pix | cartão e outros) ---------- */
+.bi-methods{
+  display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;
+}
+.bi-method{
+  display:flex;flex-direction:column;gap:3px;align-items:flex-start;text-align:left;
+  background:var(--bg-el);border:1.5px solid var(--surface-2);border-radius:var(--r);
+  padding:11px 13px;cursor:pointer;color:var(--label-2);font:inherit;
+}
+.bi-method strong{font-size:14px;color:var(--label)}
+.bi-method span{font-size:11.5px;line-height:1.4;color:var(--label-3)}
+.bi-method.on{border-color:var(--acc);background:color-mix(in srgb, var(--acc) 9%, transparent)}
+.bi-method.on strong{color:var(--acc)}

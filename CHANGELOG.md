@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+### Painel admin completo (CRUD total) + novos meios de pagamento
+
+A página de administração (`/#/painel`) virou um gerenciador completo do serviço —
+usuários, assinaturas, pagamentos, convites, configuração do aplicativo e manutenção —
+e o `/#/billing` passou a aceitar, além do Pix na hora, **cartão de crédito, PicPay,
+Google Pay e Apple Pay** pelo checkout hospedado da Cakto.
+
+**Painel admin — seis abas:**
+- **Visão geral** — 12 métricas (usuários por status, novos 7/30d, MRR, receita 30d e total,
+  pendências), estado dos meios de pagamento (Cakto, webhook HMAC, Pix, checkout hospedado,
+  chave Pix) e aprovações aguardando em um clique.
+- **Usuários (CRUD completo)** — busca por nome/e-mail/id, filtro por status (ativo, trial,
+  vencido, isento, desativado) e ordenação. Detalhe do perfil em modal com estatísticas de
+  treino, pagamentos do aluno e rotinas; ações: renomear, isentar, estender N dias, definir
+  data de acesso, reiniciar trial, marcar vencido, nota interna, encerrar sessões,
+  desativar/reativar, apagar dados de treino e excluir perfil (confirmação digitando o nome).
+- **Pagamentos** — filtros por status/meio/texto, resumo do filtro, aprovar/rejeitar/apagar
+  registro e **exportação CSV**.
+- **Convites** — gerar/revogar/copy código e liga/desliga "somente com convite" no ar.
+- **Configurações** — marca, preço, moeda, dias de trial, dias por período, chave Pix manual
+  e **ligar/desligar meios de pagamento** (Pix e/ou checkout Cakto) — tudo aplicado na hora,
+  sem redeploy (salvo em `db.settings` sobre os defaults do ambiente).
+- **Manutenção** — push em massa segmentado por status, tick manual de timers/lembretes e
+  **backup completo em JSON**.
+
+**Meios de pagamento além do Pix (`/#/billing`):**
+- Novo seletor "Pix | Cartão e outros": o checkout hospedado da Cakto
+  (`pay.cakto.com.br/{oferta}`) aceita cartão de crédito, PicPay, Google Pay, Apple Pay e
+  card+Pix conforme habilitado no produto. (Boleto não é mais suportado pela API pública da
+  Cakto desde 11/09/2026.)
+- Conciliação por `callback`: o link leva `?callback=<id do perfil>` (identificador opaco) e
+  o webhook `purchase_approved` devolve o mesmo token — a compra feita no checkout hospedado
+  aprova a assinatura automaticamente, mesmo sem cobrança local prévia (cascata:
+  `caktoId` → `refId` → cobrança pendente por callback → `metadata.sck` → e-mail).
+- Dados do pagador vistos só pela Cakto (e-mail/telefone do checkout hospedado) são gravados
+  no perfil na aprovação; pendência de checkout sobrevive a recarregar a página.
+
+**API/painel — novos endpoints** (`/api/panel/*`, todos atrás da sessão `ogadmin`):
+`GET /api/panel/user`, `user/rename`, `user/period`, `user/reset-trial`, `user/note`,
+`user/logout-all`, `user/wipe-data`, `user/delete`, `settings` (GET/POST), `invites`
+(GET/new/revoke), `broadcast`, `tick`, `backup` (GET) e `payment/delete`. `GET /api/panel/users`
+e `overview` enriquecidos (e-mail, passkeys, push, novos usuários, receita total, integração).
+`/api/config` passa a expor `billing.methods` e `billing.checkoutUrl`.
+
+**Testes**: `smoke-serverless.mjs` ganhou o run 4 — 32 asserções de CRUD, settings no ar,
+desligar Pix pelo painel, checkout hospedado idempotente, conciliação por callback,
+convite obrigatório, broadcast/tick/backup e exclusão de perfil (total 100+ asserções).
+
+
 ### Pagamentos com Cakto (edição serverless)
 
 Subscrição mensal agora pode ser cobrada pela [Cakto](https://cakto.com.br) sem intervenção

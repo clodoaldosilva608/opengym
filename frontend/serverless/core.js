@@ -106,7 +106,10 @@ async function loadDb() {
   const loaded = (await store.readJson('db', null)) || { users: [], creds: [], subs: [], invites: [], payments: [], admins: [] };
   loaded.subs = loaded.subs || []; loaded.invites = loaded.invites || [];
   loaded.payments = loaded.payments || []; loaded.admins = loaded.admins || [];
+  loaded.settings = loaded.settings || {};
   db = loaded; dbAt = Date.now();
+  // configurações editáveis no painel sobrescrevem os defaults do ambiente
+  billing.applySettings(db.settings);
   // migrações idempotentes de billing + bootstrap do painel admin (só grava se mudou)
   let changed = billing.migrateBilling(db);
   if (billing.ADMIN_USERNAME && billing.ADMIN_PASSWORD) {
@@ -237,6 +240,9 @@ async function requirePanel(req, res) {
   if (!admin) { json(res, 401, { error: 'sessão do painel expirada' }); return null; }
   return admin;
 }
+
+/* invite_only: env como default; o painel pode ligar/desligar (db.settings) */
+const inviteOnlyNow = () => billing.settings.inviteOnly == null ? INVITE_ONLY : !!billing.settings.inviteOnly;
 
 /* ---------- gate de assinatura ---------- */
 async function requireAccess(req, res) {
@@ -377,7 +383,7 @@ const routes = {
 
   'GET /api/config': async (req, res) => {
     // edição serverless não tem AI Coach — o frontend lida com a ausência da flag
-    json(res, 200, { invite_only: INVITE_ONLY, brand: billing.BRAND, billing: billing.publicBilling() });
+    json(res, 200, { invite_only: inviteOnlyNow(), brand: billing.BRAND, billing: billing.publicBilling() });
   },
 
   'GET /api/me': async (req, res) => {
@@ -391,7 +397,7 @@ const routes = {
     const name = String(body.name || '').trim().slice(0, 40);
     if (!name) return json(res, 400, { error: 'name required' });
     const code = String(body.code || '').trim().toUpperCase();
-    if (INVITE_ONLY && !db.invites.some(i => i.code === code && !i.usedBy && !i.revoked))
+    if (inviteOnlyNow() && !db.invites.some(i => i.code === code && !i.usedBy && !i.revoked))
       return json(res, 403, { error: 'a valid invite code is required' });
     const uid = crypto.randomBytes(12).toString('base64url');
     const options = await generateRegistrationOptions({
@@ -423,7 +429,7 @@ const routes = {
     const { credential } = verification.registrationInfo;
     if (db.creds.find(x => x.id === credential.id)) return json(res, 409, { error: 'credential already registered' });
     let invite = null;
-    if (INVITE_ONLY) {
+    if (inviteOnlyNow()) {
       invite = db.invites.find(i => i.code === c.code && !i.usedBy && !i.revoked);
       if (!invite) return json(res, 403, { error: 'invite code is no longer valid — ask for a new one' });
     }
@@ -674,18 +680,41 @@ const routes = {
     const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     if (user.disabled) return json(res, 403, { error: 'this account has been disabled' });
-    if (billing.CHECKOUT_METHOD === 'none') return json(res, 503, { error: 'nenhum método de pagamento configurado no servidor' });
+    const primary = billing.checkoutMethod();
+    if (primary === 'none') return json(res, 503, { error: 'nenhum método de pagamento configurado no servidor' });
+    const body = await readBody(req).catch(() => ({}));
+    // 'pix' (QR na hora) é o default; 'checkout' → checkout hospedado da Cakto
+    // (cartão, PicPay, Google Pay, Apple Pay…) — a página da Cakto coleta os
+    // dados do pagador; o `callback` (id do perfil) volta no webhook.
+    let want = body.method === 'checkout' ? 'checkout' : 'pix';
+    const avail = billing.availableMethods();
+    if (primary === 'cakto') {
+      if (want === 'checkout' && !avail.checkout) return json(res, 400, { error: 'checkout da Cakto desativado nas configurações do painel' });
+      if (want === 'pix' && !avail.pix) return json(res, 400, { error: 'Pix desativado nas configurações do painel' });
+    } else {
+      want = 'pix';                                       // mp / Pix manual seguem o fluxo de sempre
+    }
     const existing = billing.pendingPayment(db, user.id);
     if (existing) {
-      // Pix da Cakto expirou (BR Code tem prazo): marca como expirado e abre outro.
       const exp = existing.qrExpiresAt ? +new Date(existing.qrExpiresAt) : 0;
-      if (!(billing.CHECKOUT_METHOD === 'cakto' && exp && exp < Date.now()))
+      const sameKind = want === 'checkout' ? existing.method === 'cakto-checkout' : existing.method !== 'cakto-checkout';
+      // Pix da Cakto expirou (BR Code tem prazo): marca como expirado e abre outro.
+      const regenPix = want === 'pix' && primary === 'cakto' && exp && exp < Date.now();
+      if (sameKind && !regenPix)
         return json(res, 200, { payment: billing.publicPayment(existing), ...(existing.initPoint ? { initPoint: existing.initPoint } : {}) });
       existing.status = 'expired';
     }
     let payment;
-    if (billing.CHECKOUT_METHOD === 'cakto') {
-      const body = await readBody(req).catch(() => ({}));
+    if (primary === 'cakto' && want === 'checkout') {
+      const hosted = cakto.hostedCheckoutUrl();
+      payment = billing.createPayment(db, user.id, billing.PRICE, 'cakto-checkout', {
+        callback: user.id,
+        checkoutUrl: hosted ? hosted + '?callback=' + encodeURIComponent(user.id) : null
+      });
+      await saveDb();
+      return json(res, 200, { payment: billing.publicPayment(payment) });
+    }
+    if (primary === 'cakto') {
       // Dados do pagador exigidos pela Cakto (e úteis p/ conciliar o webhook):
       // e-mail, telefone E.164 e CPF. Ficam gravados no perfil p/ próximas mensalidades.
       const email = String(body.email || user.email || '').trim().toLowerCase();
@@ -710,7 +739,7 @@ const routes = {
       await saveDb();
       return json(res, 200, { payment: billing.publicPayment(payment) });
     }
-    if (billing.CHECKOUT_METHOD === 'mp') {
+    if (primary === 'mp') {
       payment = billing.createPayment(db, user.id, billing.PRICE, 'mp');
       try {
         const pref = await billing.mpCreatePreference(billing.MP_TOKEN, {
@@ -730,7 +759,7 @@ const routes = {
       payment = billing.createPayment(db, user.id, billing.PRICE, 'pix');
     }
     await saveDb();
-    json(res, 200, { payment: billing.publicPayment(payment), ...(payment.initPoint ? { initPoint: payment.initPoint } : {}), ...(billing.CHECKOUT_METHOD === 'pix' ? { pix: { key: billing.PIX_KEY, holder: billing.PIX_HOLDER, amount: billing.PRICE, currency: billing.CURRENCY } } : {}) });
+    json(res, 200, { payment: billing.publicPayment(payment), ...(payment.initPoint ? { initPoint: payment.initPoint } : {}), ...(primary === 'pix' ? { pix: { key: billing.PIX_KEY, holder: billing.PIX_HOLDER, amount: billing.PRICE, currency: billing.CURRENCY } } : {}) });
   },
 
   /* Cobrança pendente do usuário (p/ restaurar o QR do Pix depois de recarregar). */
@@ -822,15 +851,29 @@ const routes = {
       by[billing.billingStatus(u, now).code]++;
     }
     const since = now - 30 * 86400000;
-    const rev30 = (db.payments || [])
+    const week = now - 7 * 86400000;
+    const pays = db.payments || [];
+    const rev30 = pays
       .filter(p => p.status === 'approved' && p.approvedAt && +new Date(p.approvedAt) >= since)
       .reduce((s, p) => s + (+p.amount || 0), 0);
+    const revTotal = pays.filter(p => p.status === 'approved').reduce((s, p) => s + (+p.amount || 0), 0);
     json(res, 200, {
       users: db.users.length, disabled, by,
+      newUsers7: db.users.filter(u => u.created && +new Date(u.created) >= week).length,
+      newUsers30: db.users.filter(u => u.created && +new Date(u.created) >= since).length,
       mrr: by.active * billing.PRICE,
       revenue30: Math.round(rev30 * 100) / 100,
-      pendingPayments: (db.payments || []).filter(p => p.status === 'pending').length,
+      revenueTotal: Math.round(revTotal * 100) / 100,
+      approvedCount: pays.filter(p => p.status === 'approved').length,
+      pendingPayments: pays.filter(p => p.status === 'pending').length,
       price: billing.PRICE, currency: billing.CURRENCY, brand: billing.BRAND, trialDays: billing.TRIAL_DAYS,
+      methods: billing.availableMethods(),
+      integration: {
+        cakto: cakto.isConfigured(), webhookSecret: cakto.hasWebhookSecret(),
+        offerId: cakto.offerId() || null, hostedUrl: cakto.hostedCheckoutUrl(),
+        mp: !!billing.MP_TOKEN, pixKey: !!billing.PIX_KEY
+      },
+      inviteOnly: inviteOnlyNow(),
       now
     });
   },
@@ -844,13 +887,283 @@ const routes = {
       const pend = billing.pendingPayment(db, u.id);
       return {
         id: u.id, name: u.name, created: u.created || null, disabled: !!u.disabled,
+        email: u.email || null, phone: u.phone || null, invitedBy: u.invitedBy || null,
         billing: { ...billing.billingStatus(u, now), status2: u.billing?.status || null, note: u.billing?.note || null, pendingId: pend ? pend.id : null, pendingMethod: pend ? pend.method : null },
         workouts: workouts.length,
         lastWorkout: workouts.length ? workouts[workouts.length - 1].d : null,
-        lastSync: S._ts || null
+        lastSync: S._ts || null,
+        passkeys: db.creds.filter(c => c.userId === u.id).length,
+        pushes: db.subs.filter(s => s.userId === u.id).length
       };
     }));
     json(res, 200, { users, now });
+  },
+
+  /* -------- CRUD completo de usuários (painel) -------- */
+  'GET /api/panel/user': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const id = new URL(req.url, 'http://x').searchParams.get('id');
+    const u = db.users.find(x => x.id === id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    const S = (await readState(u.id)) || {};
+    const workouts = S.workouts || [];
+    const doc = String(u.docNumber || '');
+    json(res, 200, {
+      user: {
+        id: u.id, name: u.name, created: u.created || null, disabled: !!u.disabled,
+        admin: isAdmin(u), invitedBy: u.invitedBy || null,
+        email: u.email || null, phone: u.phone || null,
+        docNumber: doc ? doc.slice(0, 3) + '.' + doc.slice(3, 6) + '.***-**' : null,
+        sv: u.sv || 0,
+        billing: u.billing || null,
+        status: billing.billingStatus(u)
+      },
+      passkeys: db.creds.filter(c => c.userId === u.id).length,
+      pushes: db.subs.filter(s => s.userId === u.id).length,
+      payments: (db.payments || []).filter(p => p.userId === u.id).slice().reverse()
+        .map(p => ({ id: p.id, amount: p.amount, currency: p.currency, method: p.method, status: p.status, createdAt: p.createdAt, approvedAt: p.approvedAt || null, approvedBy: p.approvedBy || null, refId: p.caktoRefId || null })),
+      stats: {
+        workouts: workouts.length,
+        lastWorkout: workouts.length ? workouts[workouts.length - 1].d : null,
+        routines: (S.routines || []).length,
+        bodyweight: (S.bodyweight || []).length,
+        lastSync: S._ts || null,
+        unit: S.unit || 'kg',
+        reminder: S.reminder?.on ? { time: S.reminder.time, tz: S.reminder.tz } : null
+      },
+      routines: (S.routines || []).map(r => ({ id: r.id, name: r.name, emoji: r.emoji, count: (r.ex || []).length }))
+    });
+  },
+
+  'POST /api/panel/user/rename': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    const name = String(body.name || '').trim().slice(0, 40);
+    if (!name) return json(res, 400, { error: 'nome obrigatório' });
+    const old = u.name;
+    u.name = name;
+    await saveDb();
+    json(res, 200, { ok: true, old, name });
+  },
+
+  'POST /api/panel/user/period': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    const b = u.billing = u.billing || billing.newUserBilling(0);
+    if (b.free) return json(res, 400, { error: 'perfil isento — remova a isenção antes' });
+    const status = body.status === 'active' ? 'active' : 'overdue';
+    let periodEnd = null;
+    if (body.periodEnd) {
+      const t = +new Date(body.periodEnd);
+      if (!Number.isFinite(t)) return json(res, 400, { error: 'data inválida' });
+      periodEnd = new Date(t).toISOString();
+    }
+    b.status = status;
+    b.periodEnd = periodEnd;
+    b.note = body.note != null ? String(body.note).slice(0, 200) : b.note;
+    await saveDb();
+    json(res, 200, { ok: true, billing: billing.billingStatus(u) });
+  },
+
+  'POST /api/panel/user/reset-trial': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    const days = Math.max(1, Math.min(365, Math.round(+body.days || 7)));
+    u.billing = { status: 'trial', free: false, trialEndsAt: new Date(Date.now() + days * 86400000).toISOString(), periodEnd: null, grandfathered: false, note: 'trial reiniciado pelo painel' };
+    await saveDb();
+    json(res, 200, { ok: true, billing: billing.billingStatus(u) });
+  },
+
+  'POST /api/panel/user/note': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    const b = u.billing = u.billing || billing.newUserBilling(0);
+    b.note = String(body.note || '').slice(0, 200) || null;
+    await saveDb();
+    json(res, 200, { ok: true, note: b.note });
+  },
+
+  'POST /api/panel/user/logout-all': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    u.sv = (u.sv || 0) + 1;                    // invalida todas as sessões (gymsid carrega a versão)
+    await saveDb();
+    json(res, 200, { ok: true, sv: u.sv });
+  },
+
+  'POST /api/panel/user/wipe-data': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    await writeState(u.id, null);              // limpa treinos/rotinas/peso (a conta fica)
+    const rems = await store.readJson('reminders', {});
+    if (u.id in rems) { delete rems[u.id]; await store.writeJson('reminders', rems); }
+    const timers = await store.readJson('timers', {});
+    if (u.id in timers) { delete timers[u.id]; await store.writeJson('timers', timers); }
+    await saveDb();
+    json(res, 200, { ok: true });
+  },
+
+  'POST /api/panel/user/delete': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    if (isAdmin(u)) return json(res, 400, { error: 'não é possível excluir um admin do aplicativo' });
+    if (body.confirm !== u.name) return json(res, 400, { error: 'confirme digitando o nome do perfil' });
+    db.users = db.users.filter(x => x.id !== u.id);
+    db.creds = db.creds.filter(c => c.userId !== u.id);
+    db.subs = db.subs.filter(s => s.userId !== u.id);
+    db.payments = (db.payments || []).filter(p => p.userId !== u.id);
+    presence.delete(u.id);
+    stateCache.delete(u.id);
+    store.remove(stateName(u.id)).catch(() => {});
+    const rems = await store.readJson('reminders', {});
+    if (u.id in rems) { delete rems[u.id]; await store.writeJson('reminders', rems); }
+    const timers = await store.readJson('timers', {});
+    if (u.id in timers) { delete timers[u.id]; await store.writeJson('timers', timers); }
+    await saveDb();
+    json(res, 200, { ok: true });
+  },
+
+  /* -------- configurações editáveis da aplicação -------- */
+  'GET /api/panel/settings': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    json(res, 200, {
+      settings: billing.effectiveSettings(),
+      integration: {
+        cakto: cakto.isConfigured(), webhookSecret: cakto.hasWebhookSecret(),
+        offerId: cakto.offerId() || null, hostedUrl: cakto.hostedCheckoutUrl(),
+        mp: !!billing.MP_TOKEN, pixKey: !!billing.PIX_KEY
+      },
+      inviteOnly: inviteOnlyNow()
+    });
+  },
+
+  'POST /api/panel/settings': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const clean = {};
+    if ('brand' in body) {
+      const v = String(body.brand || '').trim().slice(0, 40);
+      if (!v) return json(res, 400, { error: 'nome do app não pode ficar vazio', field: 'brand' });
+      clean.brand = v;
+    }
+    if ('price' in body) {
+      const p = +body.price;
+      if (!Number.isFinite(p) || p <= 0 || p > 100000) return json(res, 400, { error: 'preço inválido', field: 'price' });
+      clean.price = Math.round(p * 100) / 100;
+    }
+    if ('currency' in body) {
+      if (!/^[a-z]{3}$/i.test(String(body.currency || ''))) return json(res, 400, { error: 'moeda deve ter 3 letras (BRL)', field: 'currency' });
+      clean.currency = String(body.currency).toUpperCase();
+    }
+    if ('trialDays' in body) {
+      const n = Math.round(+body.trialDays);
+      if (!Number.isFinite(n) || n < 0 || n > 365) return json(res, 400, { error: 'dias de trial inválidos (0–365)', field: 'trialDays' });
+      clean.trialDays = n;
+    }
+    if ('periodDays' in body) {
+      const n = Math.round(+body.periodDays);
+      if (!Number.isFinite(n) || n < 1 || n > 3650) return json(res, 400, { error: 'dias do período inválidos (1–3650)', field: 'periodDays' });
+      clean.periodDays = n;
+    }
+    if ('pixKey' in body) clean.pixKey = String(body.pixKey || '').trim().slice(0, 120);
+    if ('pixHolder' in body) clean.pixHolder = String(body.pixHolder || '').trim().slice(0, 80);
+    if ('methods' in body) clean.methods = { pix: !!body.methods?.pix, checkout: !!body.methods?.checkout };
+    if ('inviteOnly' in body) clean.inviteOnly = !!body.inviteOnly;
+    db.settings = { ...(db.settings || {}), ...clean };
+    billing.applySettings(db.settings);
+    await saveDb();
+    json(res, 200, { ok: true, settings: billing.effectiveSettings(), inviteOnly: inviteOnlyNow() });
+  },
+
+  /* -------- convites (mesma mecânica do admin interno, pelo painel) -------- */
+  'GET /api/panel/invites': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const invites = db.invites.map(i => ({
+      ...i, usedByName: i.usedBy ? (db.users.find(u => u.id === i.usedBy) || {}).name || null : null
+    }));
+    json(res, 200, { invites, invite_only: inviteOnlyNow() });
+  },
+
+  'POST /api/panel/invites/new': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    let code;
+    do { code = crypto.randomBytes(8).toString('hex').toUpperCase(); } while (db.invites.some(i => i.code === code));
+    const invite = { code, note: String(body.note || '').slice(0, 60), createdBy: 'painel:' + admin.id, created: new Date().toISOString() };
+    db.invites.push(invite);
+    await saveDb();
+    json(res, 200, { invite });
+  },
+
+  'POST /api/panel/invites/revoke': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const inv = db.invites.find(i => i.code === String(body.code || '').toUpperCase());
+    if (!inv) return json(res, 404, { error: 'no such code' });
+    if (inv.usedBy) return json(res, 400, { error: 'already used — cannot revoke' });
+    db.invites = db.invites.filter(i => i.code !== inv.code);
+    await saveDb();
+    json(res, 200, { ok: true });
+  },
+
+  /* -------- manutenção -------- */
+  'POST /api/panel/broadcast': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const title = String(body.title || '').trim().slice(0, 60);
+    const text = String(body.body || '').trim().slice(0, 140);
+    if (!title || !text) return json(res, 400, { error: 'título e mensagem são obrigatórios' });
+    const target = ['all', 'active', 'trial', 'overdue', 'free'].includes(body.target) ? body.target : 'all';
+    const now = Date.now();
+    let sent = 0, skipped = 0;
+    for (const u of db.users) {
+      if (u.disabled || !db.subs.some(s => s.userId === u.id)) { skipped++; continue; }   // sem push cadastrado
+      if (target !== 'all' && billing.billingStatus(u, now).code !== target) { skipped++; continue; }
+      const okPush = await sendPush(u.id, { title, body: text, tag: 'broadcast' }).then(() => true).catch(() => false);
+      okPush ? sent++ : skipped++;
+    }
+    json(res, 200, { ok: true, sent, skipped });
+  },
+
+  'POST /api/panel/tick': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const out = await tick();
+    json(res, 200, { ok: true, ...out });
+  },
+
+  'GET /api/panel/backup': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const dump = JSON.stringify({ exportedAt: new Date().toISOString(), db }, null, 2);
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Content-Disposition': 'attachment; filename="opengym-backup-' + new Date().toISOString().slice(0, 10) + '.json"',
+      'Cache-Control': 'no-store'
+    });
+    res.end(dump);
+  },
+
+  'POST /api/panel/payment/delete': async (req, res) => {
+    const admin = await requirePanel(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const before = (db.payments || []).length;
+    db.payments = (db.payments || []).filter(p => p.id !== String(body.id || ''));
+    if (db.payments.length === before) return json(res, 404, { error: 'cobrança não encontrada' });
+    await saveDb();
+    json(res, 200, { ok: true });
   },
 
   'GET /api/panel/payments': async (req, res) => {
@@ -921,16 +1234,21 @@ const routes = {
 
 /* ---------- webhook Cakto: aplica eventos de compra/assinatura ----------
    Conciliação por ordem: 1) cobrança aberta pelo app (payment.caktoId === data.id,
-   ou refId); 2) metadata.sck (userId enviado na criação); 3) e-mail do pagador —
-   cobre compras feitas direto no checkout público da Cakto. Idempotente:
-   payment já aprovado não é reaprovado (periodEnd não avança duas vezes). */
+   refId ou callback); 2) metadata.sck (userId enviado na criação); 3) `callback`
+   do checkout hospedado (id do perfil enviado em ?callback=); 4) e-mail do
+   pagador — cobre compras feitas direto no checkout público da Cakto.
+   Idempotente: payment já aprovado não é reaprovado (periodEnd não avança). */
 function findCaktoPayment(d) {
   const orderId = String(d.id || '');
   const refId = String(d.refId || '');
+  const cb = String(d.callback || '');
   return (db.payments || []).find(p => orderId && p.caktoId === orderId)
-    || (db.payments || []).find(p => refId && p.caktoRefId === refId);
+    || (db.payments || []).find(p => refId && p.caktoRefId === refId)
+    || (db.payments || []).find(p => cb && p.callback === cb && p.status === 'pending');
 }
 function findUserByCakto(d) {
+  const cb = String(d.callback || '');
+  if (cb) { const u = (db.users || []).find(x => x.id === cb); if (u) return u; }
   const sck = String(d.metadata?.sck || d.sck || '');
   if (sck) { const u = (db.users || []).find(x => x.id === sck); if (u) return u; }
   const email = String(d.customer?.email || '').trim().toLowerCase();
@@ -947,14 +1265,16 @@ async function applyCaktoEvent(event, d) {
   let p = findCaktoPayment(d);
   let u = p ? (db.users || []).find(x => x.id === p.userId) : null;
   const noteTag = `[cakto ${d.refId || orderId.slice(0, 8)}]`;
+  const methodOf = dd => (String(dd.paymentMethod || '') === 'pix' ? 'cakto' : 'cakto-checkout');
 
   if (event === 'purchase_approved') {
     if (!p) {
       // Cobrança não existe localmente: compra direto no checkout público da Cakto
-      // (ou registro perdido). Casa o pagador por sck/e-mail e registra.
+      // (ou registro perdido). Casa o pagador por callback/sck/e-mail e registra.
       u = findUserByCakto(d);
-      p = billing.createPayment(db, u?.id, Number(d.amount ?? billing.PRICE), 'cakto', {
+      p = billing.createPayment(db, u?.id, Number(d.amount ?? billing.PRICE), methodOf(d), {
         caktoId: orderId, caktoRefId: d.refId ? String(d.refId) : null,
+        callback: d.callback ? String(d.callback) : null,
         method2: String(d.paymentMethod || ''), checkoutUrl: d.checkoutUrl || null, webhookDirect: true
       });
     }
@@ -963,6 +1283,11 @@ async function applyCaktoEvent(event, d) {
     if (p.status === 'rejected' || p.status === 'failed') p.status = 'pending';
     p.caktoStatus = d.status || 'paid';
     p.paidAmount = Number(d.amount ?? p.amount);
+    if (u) {
+      // dados do pagador que só a Cakto viu (checkout hospedado): guarda no perfil
+      if (!u.email && d.customer?.email) u.email = String(d.customer.email).trim().toLowerCase();
+      if (!u.phone && d.customer?.phone) u.phone = cakto.normalizePhone(d.customer.phone) || u.phone;
+    }
     if (!u) { p.status = 'approved'; p.approvedBy = 'cakto'; p.approvedAt = new Date().toISOString(); return 'orphan-approved'; }
     const approved = billing.approvePayment(db, p.id, { by: 'cakto' });
     if (approved) sendPush(u.id, { title: `${billing.BRAND}`, body: 'Pagamento aprovado — bom treino! 💪', tag: 'billing' }).catch(() => {});

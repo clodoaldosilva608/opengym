@@ -12,25 +12,92 @@
      'mp'    — Mercado Pago: cria preferência de checkout; o mesmo webhook
                despacha por forma de pagamento.                             */
 import crypto from 'node:crypto';
-import { isConfigured as caktoConfigured } from './cakto.js';
+import { isConfigured as caktoConfigured, hostedCheckoutUrl } from './cakto.js';
 
-export const PERIOD_DAYS = Math.max(1, +(process.env.PERIOD_DAYS || 30) || 30);
-export const TRIAL_DAYS = Math.max(0, +(process.env.TRIAL_DAYS ?? 7) || 7);
-export const PRICE = (() => {
-  const p = +(process.env.PRICE_MONTHLY ?? 14.9);
-  return Number.isFinite(p) && p > 0 ? Math.round(p * 100) / 100 : 14.9;
-})();
-export const CURRENCY = (process.env.PRICE_CURRENCY || 'BRL').toUpperCase();
-export const BRAND = (process.env.APP_BRAND || 'openGym').slice(0, 40);
-export const PIX_KEY = (process.env.PIX_KEY || '').trim();
-export const PIX_HOLDER = (process.env.PIX_HOLDER || '').trim();
+/* Valores padrão vindos do ambiente — o painel admin pode sobrescrever via
+   db.settings (applySettings). Exportados com `let` de propósito: as bindings
+   vivas do ESM fazem o importador ver o valor atualizado depois do apply. */
+const ENV = {
+  PERIOD_DAYS: Math.max(1, +(process.env.PERIOD_DAYS || 30) || 30),
+  TRIAL_DAYS: Math.max(0, +(process.env.TRIAL_DAYS ?? 7) || 7),
+  PRICE: (() => {
+    const p = +(process.env.PRICE_MONTHLY ?? 14.9);
+    return Number.isFinite(p) && p > 0 ? Math.round(p * 100) / 100 : 14.9;
+  })(),
+  CURRENCY: (process.env.PRICE_CURRENCY || 'BRL').toUpperCase(),
+  BRAND: (process.env.APP_BRAND || 'openGym').slice(0, 40),
+  PIX_KEY: (process.env.PIX_KEY || '').trim(),
+  PIX_HOLDER: (process.env.PIX_HOLDER || '').trim()
+};
+export let PERIOD_DAYS = ENV.PERIOD_DAYS;
+export let TRIAL_DAYS = ENV.TRIAL_DAYS;
+export let PRICE = ENV.PRICE;
+export let CURRENCY = ENV.CURRENCY;
+export let BRAND = ENV.BRAND;
+export let PIX_KEY = ENV.PIX_KEY;
+export let PIX_HOLDER = ENV.PIX_HOLDER;
 export const MP_TOKEN = (process.env.MERCADOPAGO_ACCESS_TOKEN || '').trim();
 export const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || '').trim();
 export const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 export const ADMIN_SESSION_DAYS = Math.max(1, +(process.env.ADMIN_SESSION_DAYS || 2) || 2);
-// Quem pode assinar: 'all' (padrão) ou 'invite' (só quem entrou com convite — usa o fluxo existente)
-// Prioridade: Cakto (Pix automático via webhook) > Mercado Pago > Pix manual > nenhum.
-export const CHECKOUT_METHOD = caktoConfigured() ? 'cakto' : MP_TOKEN ? 'mp' : (PIX_KEY ? 'pix' : 'none');
+
+/* -------- configurações editáveis no painel (db.settings) ----------------
+   Tudo opcional: campo ausente = valor do ambiente. `methods` só tem efeito
+   quando o Cakto está configurado (liga/desliga Pix inline e checkout
+   hospedado — cartão, PicPay, Google Pay, Apple Pay…). inviteOnly null =
+   segue a env INVITE_ONLY. */
+export const settings = { inviteOnly: null };
+const clamp = (v, min, max, dflt) => {
+  const n = Math.round(+v);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : dflt;
+};
+const r2 = v => Math.round(v * 100) / 100;
+export function applySettings(s = {}) {
+  Object.assign(settings, {
+    price: Number.isFinite(+s.price) && +s.price > 0 ? r2(+s.price) : null,
+    currency: /^[a-z]{3}$/i.test(String(s.currency || '')) ? String(s.currency).toUpperCase() : null,
+    brand: s.brand != null && String(s.brand).trim() ? String(s.brand).trim().slice(0, 40) : null,
+    trialDays: s.trialDays != null ? clamp(s.trialDays, 0, 365, null) : null,
+    periodDays: s.periodDays != null ? clamp(s.periodDays, 1, 3650, null) : null,
+    pixKey: s.pixKey != null ? String(s.pixKey).trim().slice(0, 120) : null,
+    pixHolder: s.pixHolder != null ? String(s.pixHolder).trim().slice(0, 80) : null,
+    methods: s.methods && typeof s.methods === 'object'
+      ? { pix: s.methods.pix !== false, checkout: s.methods.checkout !== false }
+      : null,
+    inviteOnly: s.inviteOnly == null ? null : !!s.inviteOnly
+  });
+  PRICE = settings.price ?? ENV.PRICE;
+  CURRENCY = settings.currency ?? ENV.CURRENCY;
+  BRAND = settings.brand ?? ENV.BRAND;
+  TRIAL_DAYS = settings.trialDays ?? ENV.TRIAL_DAYS;
+  PERIOD_DAYS = settings.periodDays ?? ENV.PERIOD_DAYS;
+  PIX_KEY = settings.pixKey ?? ENV.PIX_KEY;
+  PIX_HOLDER = settings.pixHolder ?? ENV.PIX_HOLDER;
+}
+/* Valores efetivos para o painel (com os padrões já resolvidos). */
+export function effectiveSettings() {
+  return {
+    brand: BRAND, price: PRICE, currency: CURRENCY,
+    trialDays: TRIAL_DAYS, periodDays: PERIOD_DAYS,
+    pixKey: PIX_KEY, pixHolder: PIX_HOLDER,
+    methods: settings.methods || { pix: true, checkout: true },
+    inviteOnly: settings.inviteOnly
+  };
+}
+
+// Prioridade: Cakto (webhook aprova sozinho) > Mercado Pago > Pix manual > nenhum.
+export const checkoutMethod = () => caktoConfigured() ? 'cakto' : MP_TOKEN ? 'mp' : (PIX_KEY ? 'pix' : 'none');
+// Métodos disponíveis para o usuário escolher no /#/billing:
+export function availableMethods() {
+  const m = checkoutMethod();
+  if (m === 'cakto') {
+    const cfg = settings.methods || { pix: true, checkout: true };
+    return { pix: cfg.pix !== false, checkout: cfg.checkout !== false };
+  }
+  if (m === 'mp') return { mp: true };
+  if (m === 'pix') return { pix: true };       // Pix manual (chave + aprovação do admin)
+  return {};
+}
 
 /* ------------------------------ status ------------------------------ */
 // Fonte única de verdade do acesso. Códigos:
@@ -183,9 +250,13 @@ export async function mpFetchPayment(token, paymentId) {
 /* ------------------------- resposta pública -------------------------- */
 // O que o /api/config e o /api/me devolvem sobre faturamento — sem nada sensível.
 export function publicBilling() {
+  const methods = availableMethods();
   return {
     brand: BRAND, price: PRICE, currency: CURRENCY, trialDays: TRIAL_DAYS,
-    method: CHECKOUT_METHOD, pix: PIX_KEY ? { key: PIX_KEY, holder: PIX_HOLDER } : null
+    method: checkoutMethod(),
+    methods,                                                        // {pix,checkout} | {mp} | {pix} | {}
+    checkoutUrl: methods.checkout ? hostedCheckoutUrl() : null,     // checkout hospedado Cakto (cartão/PicPay/GPay/ApplePay)
+    pix: PIX_KEY ? { key: PIX_KEY, holder: PIX_HOLDER } : null
   };
 }
 // Registro de pagamento seguro para devolver ao frontend (nunca vazar
