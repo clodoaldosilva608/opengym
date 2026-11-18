@@ -840,8 +840,12 @@ const routes = {
 export default async function handler(req, res) {
   try {
     await init();
+    // Na Vercel o rewrite manda /api/<sub> → /api/api?__p=<sub> (query original anexada).
+    // No dev local (sem rewrite) req.url já é o caminho completo.
     const url = new URL(req.url, 'http://x');
-    const pathname = url.pathname.replace(/\/+$/, '') || url.pathname;
+    const sub = url.searchParams.get('__p');
+    const rawPath = sub ? '/api/' + sub : url.pathname;
+    const pathname = rawPath.replace(/\/+$/, '') || rawPath;
     const key = req.method + ' ' + pathname;
     const handler = routes[key];
     if (handler) {

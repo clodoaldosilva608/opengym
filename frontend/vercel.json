@@ -1,5 +1,5 @@
 {
-  "crons": [
-    { "path": "/api/cron/tick", "schedule": "0 12 * * *" }
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api/api?__p=:path*" }
   ]
 }
