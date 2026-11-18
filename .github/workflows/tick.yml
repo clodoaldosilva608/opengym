@@ -1,0 +1,19 @@
+# Tick da API serverless: dispara lembretes diários e timers de descanso
+# pendentes mesmo quando ninguém está batendo na API. A precisão dos lembretes
+# é ±5 minutos (o schedule do GitHub Actions é aproximado); requisições normais
+# da app também disparam o tick cooperativo com throttle de 20s.
+name: tick
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: GET /api/cron/tick
+        run: |
+          curl -sS -m 25 -X GET \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -w "\nHTTP %{http_code}\n" \
+            https://opengyn.vercel.app/api/cron/tick || true
