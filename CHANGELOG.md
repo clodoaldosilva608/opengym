@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Pagamentos com Cakto (edição serverless)
+
+Subscrição mensal agora pode ser cobrada pela [Cakto](https://cakto.com.br) sem intervenção
+manual: o servidor abre uma cobrança Pix pela API pública da Cakto, mostra o QR copia-e-cola
+no app e libera o acesso automaticamente quando o webhook assinado da Cakto confirma o
+pagamento.
+
+- **`frontend/serverless/cakto.js`** — cliente sem dependências da API pública do Cakto:
+  OAuth2 com cache de token (10 h), criação de cobrança Pix (`X-Idempotency-Key`), consulta
+  de pedido e validação de webhook (HMAC-SHA256 sobre `{timestamp}.{body}`, tolerância 5 min,
+  fallback do `secret` no corpo descrito na doc). Normaliza telefone (E.164 BR) e valida CPF
+  (dígitos verificadores).
+- **Checkout no app** (`/#/billing`): coleta e-mail, telefone e CPF do pagador (exigências
+  da Cakto, gravadas no perfil para as próximas mensalidades), gera o Pix na hora, renderiza
+  o QR localmente (pacote `qrcode`, sem serviço externo) e mantém link para o checkout
+  público da Cakto (cartão). Pix expirado pode ser regenerado; a pendência sobrevive a
+  recarregar a página (`GET /api/billing/pending`).
+- **Webhook `/api/billing/webhook`** (rota compartilhada com o Mercado Pago): `purchase_approved`
+  aprova e prorroga 30 dias a partir do fim do período corrente; `refund`/`chargeback` revogam;
+  `purchase_refused` marca rejeitada; eventos de assinatura (`subscription_*`) criam/renovam/
+  anotam. Conciliação em cascata: `payment.caktoId` → `refId` → `metadata.sck` (userId) →
+  e-mail do pagador (cobre compras feitas direto no checkout público da Cakto). Idempotente:
+  evento repetido não prorroga duas vezes.
+- **Config**: `CAKTO_CLIENT_ID`, `CAKTO_CLIENT_SECRET`, `CAKTO_OFFER_ID`, `CAKTO_WEBHOOK_SECRET`,
+  `CAKTO_PIX_EXPIRES_IN` (s, default 3600), `CAKTO_BASE_URL` (mock em testes). O método de
+  pagamento do `/api/config` vira `cakto` quando as credenciais estão presentes (prioridade:
+  Cakto > Mercado Pago > Pix manual).
+- **Testes**: `smoke-serverless.mjs` ganhou o run 3 — API da Cakto mockada, validação do
+  pagador, webhook assinado/inválido, idempotência, revogação por reembolso e venda direta
+  casada por e-mail (24 asserções).
+
 ### The AI Coach
 
 openGym could always progress a plan. It could never *write* one, and it never looked at the

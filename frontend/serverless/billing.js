@@ -5,10 +5,14 @@
      db.payments  = [{ id, userId, amount, method, status, createdAt, ... }]
      db.admins    = [{ id, username, salt, hash, created }]
    Fluxos de pagamento:
-     'pix'  — manual: mostra a chave Pix, o usuário avisa, o admin aprova no painel.
-     'mp'   — Mercado Pago: cria preferência de checkout; o webhook /api/billing/webhook
-              busca o pagamento na API do MP e aprova sozinho.               */
+     'cakto' — Cakto (docs.cakto.com.br): cria cobrança Pix pela API pública;
+               o webhook /api/billing/webhook valida a assinatura HMAC e aprova
+               sozinho (sem intervenção do admin). Cliente em cakto.js.
+     'pix'   — manual: mostra a chave Pix, o usuário avisa, o admin aprova no painel.
+     'mp'    — Mercado Pago: cria preferência de checkout; o mesmo webhook
+               despacha por forma de pagamento.                             */
 import crypto from 'node:crypto';
+import { isConfigured as caktoConfigured } from './cakto.js';
 
 export const PERIOD_DAYS = Math.max(1, +(process.env.PERIOD_DAYS || 30) || 30);
 export const TRIAL_DAYS = Math.max(0, +(process.env.TRIAL_DAYS ?? 7) || 7);
@@ -25,7 +29,8 @@ export const ADMIN_USERNAME = (process.env.ADMIN_USERNAME || '').trim();
 export const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 export const ADMIN_SESSION_DAYS = Math.max(1, +(process.env.ADMIN_SESSION_DAYS || 2) || 2);
 // Quem pode assinar: 'all' (padrão) ou 'invite' (só quem entrou com convite — usa o fluxo existente)
-export const CHECKOUT_METHOD = MP_TOKEN ? 'mp' : (PIX_KEY ? 'pix' : 'none');
+// Prioridade: Cakto (Pix automático via webhook) > Mercado Pago > Pix manual > nenhum.
+export const CHECKOUT_METHOD = caktoConfigured() ? 'cakto' : MP_TOKEN ? 'mp' : (PIX_KEY ? 'pix' : 'none');
 
 /* ------------------------------ status ------------------------------ */
 // Fonte única de verdade do acesso. Códigos:
@@ -181,6 +186,17 @@ export function publicBilling() {
   return {
     brand: BRAND, price: PRICE, currency: CURRENCY, trialDays: TRIAL_DAYS,
     method: CHECKOUT_METHOD, pix: PIX_KEY ? { key: PIX_KEY, holder: PIX_HOLDER } : null
+  };
+}
+// Registro de pagamento seguro para devolver ao frontend (nunca vazar
+// credenciais; dados de Pix são públicos por natureza).
+export function publicPayment(p) {
+  if (!p) return null;
+  return {
+    id: p.id, caktoId: p.caktoId || null, amount: p.amount, currency: p.currency, method: p.method,
+    status: p.status, createdAt: p.createdAt, approvedAt: p.approvedAt || null,
+    checkoutUrl: p.checkoutUrl || null, qrCode: p.qrCode || null,
+    qrExpiresAt: p.qrExpiresAt || null, refId: p.caktoRefId || null
   };
 }
 // Resumo para /api/me e /api/billing/status — `pendingPayment` precisa do db real, por

@@ -20,6 +20,7 @@ import {
 } from '@simplewebauthn/server';
 import webpush from 'web-push';
 import * as billing from './billing.js';
+import * as cakto from './cakto.js';
 import * as store from './storage.js';
 
 const RP_ID = process.env.RP_ID || 'localhost';
@@ -53,6 +54,20 @@ function readBody(req) {
       try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}); }
       catch { reject(new Error('bad json')); }
     });
+    req.on('error', reject);
+  });
+}
+/* Corpo cru (texto) — necessário para validar a assinatura HMAC de webhooks
+   (Cakto assina os bytes exatos recebidos, não o objeto reparseado). */
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0; const chunks = [];
+    req.on('data', d => {
+      size += d.length;
+      if (size > MAX_BODY) { reject(new Error('body too large')); req.destroy(); return; }
+      chunks.push(d);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
 }
@@ -646,7 +661,11 @@ const routes = {
     const user = await readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     json(res, 200, {
-      billing: { ...billing.meBilling(user), pending: !!billing.pendingPayment(db, user.id) },
+      billing: {
+        ...billing.meBilling(user),
+        pending: !!billing.pendingPayment(db, user.id),
+        payer: { email: user.email || null, phone: user.phone || null, docReady: !!user.docNumber }
+      },
       config: billing.publicBilling()
     });
   },
@@ -657,8 +676,40 @@ const routes = {
     if (user.disabled) return json(res, 403, { error: 'this account has been disabled' });
     if (billing.CHECKOUT_METHOD === 'none') return json(res, 503, { error: 'nenhum método de pagamento configurado no servidor' });
     const existing = billing.pendingPayment(db, user.id);
-    if (existing) return json(res, 200, { payment: existing, ...(existing.initPoint ? { initPoint: existing.initPoint } : {}) });
+    if (existing) {
+      // Pix da Cakto expirou (BR Code tem prazo): marca como expirado e abre outro.
+      const exp = existing.qrExpiresAt ? +new Date(existing.qrExpiresAt) : 0;
+      if (!(billing.CHECKOUT_METHOD === 'cakto' && exp && exp < Date.now()))
+        return json(res, 200, { payment: billing.publicPayment(existing), ...(existing.initPoint ? { initPoint: existing.initPoint } : {}) });
+      existing.status = 'expired';
+    }
     let payment;
+    if (billing.CHECKOUT_METHOD === 'cakto') {
+      const body = await readBody(req).catch(() => ({}));
+      // Dados do pagador exigidos pela Cakto (e úteis p/ conciliar o webhook):
+      // e-mail, telefone E.164 e CPF. Ficam gravados no perfil p/ próximas mensalidades.
+      const email = String(body.email || user.email || '').trim().toLowerCase();
+      const phone = cakto.normalizePhone(body.phone || user.phone);
+      const docNumber = cakto.onlyDigits(body.docNumber || user.docNumber);
+      if (!cakto.validEmail(email)) return json(res, 400, { error: 'informe um e-mail válido para receber a nota da compra', field: 'email' });
+      if (!phone) return json(res, 400, { error: 'telefone inválido — use DDD + número (ex.: 11 91234-5678)', field: 'phone' });
+      if (!cakto.validCPF(docNumber)) return json(res, 400, { error: 'CPF inválido — informe os 11 dígitos', field: 'docNumber' });
+      user.email = email; user.phone = phone; user.docNumber = docNumber;
+      payment = billing.createPayment(db, user.id, billing.PRICE, 'cakto');
+      try {
+        const charge = await cakto.createPixCharge({
+          customer: { name: user.name || 'Cliente openGym', email, phone, docType: 'cpf', docNumber, fingerprint: 'opengym-' + user.id },
+          sck: user.id
+        });
+        Object.assign(payment, charge);
+      } catch (e) {
+        payment.status = 'failed'; payment.error = String(e.message || e).slice(0, 200);
+        await saveDb();
+        return json(res, 502, { error: 'falha ao abrir cobrança Pix no Cakto: ' + String(e.message || e).slice(0, 160) });
+      }
+      await saveDb();
+      return json(res, 200, { payment: billing.publicPayment(payment) });
+    }
     if (billing.CHECKOUT_METHOD === 'mp') {
       payment = billing.createPayment(db, user.id, billing.PRICE, 'mp');
       try {
@@ -679,27 +730,59 @@ const routes = {
       payment = billing.createPayment(db, user.id, billing.PRICE, 'pix');
     }
     await saveDb();
-    json(res, 200, { payment, ...(payment.initPoint ? { initPoint: payment.initPoint } : {}), ...(billing.CHECKOUT_METHOD === 'pix' ? { pix: { key: billing.PIX_KEY, holder: billing.PIX_HOLDER, amount: billing.PRICE, currency: billing.CURRENCY } } : {}) });
+    json(res, 200, { payment: billing.publicPayment(payment), ...(payment.initPoint ? { initPoint: payment.initPoint } : {}), ...(billing.CHECKOUT_METHOD === 'pix' ? { pix: { key: billing.PIX_KEY, holder: billing.PIX_HOLDER, amount: billing.PRICE, currency: billing.CURRENCY } } : {}) });
   },
 
+  /* Cobrança pendente do usuário (p/ restaurar o QR do Pix depois de recarregar). */
+  'GET /api/billing/pending': async (req, res) => {
+    const user = await readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    json(res, 200, { payment: billing.publicPayment(billing.pendingPayment(db, user.id)) });
+  },
+
+  /* Webhook de pagamento: Cakto (assina HMAC-SHA256) e Mercado Pago compartilham
+     a rota. O corpo cru é necessário p/ verificar a assinatura da Cakto. */
   'POST /api/billing/webhook': async (req, res) => {
     const url = new URL(req.url, 'http://x');
-    const body = await readBody(req).catch(() => ({}));
-    const mpPaymentId = body?.data?.id || url.searchParams.get('data.id') || url.searchParams.get('id');
-    if (!billing.MP_TOKEN || !mpPaymentId) return json(res, 200, { ok: true });
+    const raw = await readRawBody(req);
+    let body = {};
+    try { body = raw ? JSON.parse(raw) : {}; } catch { return json(res, 200, { ok: true, ignored: 'bad json' }); }
+
+    /* --- Mercado Pago: notificação com data.id + token do MP configurado --- */
+    if (billing.MP_TOKEN && !body.event && !body.secret) {
+      const mpPaymentId = body?.data?.id || url.searchParams.get('data.id') || url.searchParams.get('id');
+      if (!mpPaymentId) return json(res, 200, { ok: true });
+      try {
+        const mp = await billing.mpFetchPayment(billing.MP_TOKEN, mpPaymentId);
+        if (mp.status !== 'approved' || !mp.external_reference) return json(res, 200, { ok: true, ignored: mp.status });
+        const local = (db.payments || []).find(p => p.id === mp.external_reference);
+        if (!local || local.status !== 'pending') return json(res, 200, { ok: true, ignored: 'no pending payment' });
+        local.mpPaymentId = String(mp.id);
+        local.paidAmount = mp.transaction_amount;
+        const u = billing.approvePayment(db, local.id, { by: 'mercadopago' });
+        await saveDb();
+        if (u) sendPush(u.id, { title: `${billing.BRAND}`, body: 'Pagamento aprovado — bom treino! 💪', tag: 'billing' }).catch(() => {});
+        return json(res, 200, { ok: true });
+      } catch (e) {
+        console.error('billing webhook (mp)', e);
+        return json(res, 500, { error: 'webhook error' });
+      }
+    }
+
+    /* --- Cakto: valida origem (assinatura header; fallback secret no corpo) --- */
+    const ver = cakto.verifyWebhook(raw, req.headers['x-cakto-timestamp'], req.headers['x-cakto-signature']);
+    if (!ver.ok && !cakto.bodySecretMatches(body)) {
+      console.error('cakto webhook rejeitado:', ver.reason);
+      return json(res, 403, { error: 'invalid webhook signature' });
+    }
+    const event = String(body.event || '');
+    const d = body.data || {};
     try {
-      const mp = await billing.mpFetchPayment(billing.MP_TOKEN, mpPaymentId);
-      if (mp.status !== 'approved' || !mp.external_reference) return json(res, 200, { ok: true, ignored: mp.status });
-      const local = (db.payments || []).find(p => p.id === mp.external_reference);
-      if (!local || local.status !== 'pending') return json(res, 200, { ok: true, ignored: 'no pending payment' });
-      local.mpPaymentId = String(mp.id);
-      local.paidAmount = mp.transaction_amount;
-      const u = billing.approvePayment(db, local.id, { by: 'mercadopago' });
+      const outcome = await applyCaktoEvent(event, d);
       await saveDb();
-      if (u) sendPush(u.id, { title: `${billing.BRAND}`, body: 'Pagamento aprovado — bom treino! 💪', tag: 'billing' }).catch(() => {});
-      json(res, 200, { ok: true });
+      json(res, 200, { ok: true, ...(outcome ? { outcome } : {}) });
     } catch (e) {
-      console.error('billing webhook', e);
+      console.error('cakto webhook', event, e);
       json(res, 500, { error: 'webhook error' });
     }
   },
@@ -835,6 +918,102 @@ const routes = {
     json(res, 200, { ok: true });
   }
 };
+
+/* ---------- webhook Cakto: aplica eventos de compra/assinatura ----------
+   Conciliação por ordem: 1) cobrança aberta pelo app (payment.caktoId === data.id,
+   ou refId); 2) metadata.sck (userId enviado na criação); 3) e-mail do pagador —
+   cobre compras feitas direto no checkout público da Cakto. Idempotente:
+   payment já aprovado não é reaprovado (periodEnd não avança duas vezes). */
+function findCaktoPayment(d) {
+  const orderId = String(d.id || '');
+  const refId = String(d.refId || '');
+  return (db.payments || []).find(p => orderId && p.caktoId === orderId)
+    || (db.payments || []).find(p => refId && p.caktoRefId === refId);
+}
+function findUserByCakto(d) {
+  const sck = String(d.metadata?.sck || d.sck || '');
+  if (sck) { const u = (db.users || []).find(x => x.id === sck); if (u) return u; }
+  const email = String(d.customer?.email || '').trim().toLowerCase();
+  if (email) {
+    const u = (db.users || []).find(x => String(x.email || '').toLowerCase() === email);
+    if (u) return u;
+  }
+  return null;
+}
+async function applyCaktoEvent(event, d) {
+  const orderId = d.id ? String(d.id) : '';
+  const refId = d.refId ? String(d.refId) : '';
+  if (!orderId && !refId) return 'no-order-id';
+  let p = findCaktoPayment(d);
+  let u = p ? (db.users || []).find(x => x.id === p.userId) : null;
+  const noteTag = `[cakto ${d.refId || orderId.slice(0, 8)}]`;
+
+  if (event === 'purchase_approved') {
+    if (!p) {
+      // Cobrança não existe localmente: compra direto no checkout público da Cakto
+      // (ou registro perdido). Casa o pagador por sck/e-mail e registra.
+      u = findUserByCakto(d);
+      p = billing.createPayment(db, u?.id, Number(d.amount ?? billing.PRICE), 'cakto', {
+        caktoId: orderId, caktoRefId: d.refId ? String(d.refId) : null,
+        method2: String(d.paymentMethod || ''), checkoutUrl: d.checkoutUrl || null, webhookDirect: true
+      });
+    }
+    if (!u) u = (db.users || []).find(x => x.id === p.userId) || findUserByCakto(d);
+    if (p.status === 'approved') return 'already-approved';            // idempotente
+    if (p.status === 'rejected' || p.status === 'failed') p.status = 'pending';
+    p.caktoStatus = d.status || 'paid';
+    p.paidAmount = Number(d.amount ?? p.amount);
+    if (!u) { p.status = 'approved'; p.approvedBy = 'cakto'; p.approvedAt = new Date().toISOString(); return 'orphan-approved'; }
+    const approved = billing.approvePayment(db, p.id, { by: 'cakto' });
+    if (approved) sendPush(u.id, { title: `${billing.BRAND}`, body: 'Pagamento aprovado — bom treino! 💪', tag: 'billing' }).catch(() => {});
+    return approved ? 'approved' : 'approve-failed';
+  }
+  if (event === 'purchase_refused' || event === 'checkout_abandonment') {
+    if (p && p.status === 'pending') { p.status = event === 'purchase_refused' ? 'rejected' : 'expired'; p.caktoStatus = d.status || null; return 'marked-' + p.status; }
+    return 'ignored';
+  }
+  if (event === 'refund' || event === 'chargeback') {
+    // Devolveu / contestou: revoga o período concedido por essa cobrança.
+    if (!p) return 'ignored';
+    p.status = event === 'refund' ? 'refunded' : 'chargeback';
+    p.caktoStatus = d.status || null;
+    if (!u) u = (db.users || []).find(x => x.id === p.userId);
+    if (u && u.billing && !u.billing.free) {
+      const b = u.billing;
+      if (b.periodEnd && +new Date(b.periodEnd) > Date.now()) b.periodEnd = new Date(Date.now() - 1000).toISOString();
+      b.status = 'overdue';
+      b.note = `${noteTag} acesso revogado por ${event === 'refund' ? 'reembolso' : 'chargeback'}`;
+    }
+    return 'revoked';
+  }
+  if (event === 'subscription_created' || event === 'subscription_renewed' || event === 'subscription_late_recovered' || event === 'subscription_resumed') {
+    // Assinatura (produto do tipo subscription): concede/prorroga o período.
+    if (!u) u = findUserByCakto(d);
+    if (!u) return 'user-not-found';
+    if (p && p.status === 'pending') { p.caktoStatus = d.status || 'paid'; billing.approvePayment(db, p.id, { by: 'cakto' }); return 'approved'; }
+    const b = u.billing = u.billing || billing.newUserBilling(0);
+    const base = b.periodEnd && +new Date(b.periodEnd) > Date.now() ? +new Date(b.periodEnd) : Date.now();
+    b.status = 'active';
+    b.periodEnd = new Date(base + billing.PERIOD_DAYS * 86400000).toISOString();
+    b.free = false;
+    b.note = `${noteTag} assinatura ${event === 'subscription_created' ? 'criada' : 'renovada'}`;
+    sendPush(u.id, { title: `${billing.BRAND}`, body: 'Assinatura ativa — bom treino! 💪', tag: 'billing' }).catch(() => {});
+    return 'subscription-active';
+  }
+  if (event === 'subscription_canceled' || event === 'subscription_renewal_refused' || event === 'subscription_late' || event === 'subscription_paused') {
+    if (!u) u = findUserByCakto(d);
+    if (u && u.billing && !u.billing.free) {
+      // Não corta o período já pago — apenas registra; o acesso cai no fim natural.
+      u.billing.note = `${noteTag} ${event}`;
+    }
+    return 'noted';
+  }
+  if (event === 'pix_gerado') {
+    if (p) { p.caktoStatus = d.status || 'waiting_payment'; return 'noted'; }
+    return 'ignored';
+  }
+  return 'unhandled-event';
+}
 
 /* handler principal: rotas exatas + prefixos (coach → 503) + 404 */
 export default async function handler(req, res) {

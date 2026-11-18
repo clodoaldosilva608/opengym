@@ -2,11 +2,14 @@
    Sobe scripts/dev-serverless.mjs com DATA_BACKEND=fs (disco temporário) e exercita:
    run 1 — migração (dono pré-existente fica isento), painel admin, acesso liberado;
    run 2 — usuário vencido → 402 no /api/data → checkout Pix → aprovação no painel
-           → acesso ativo → isenção → desafios WebAuthn persistidos → timers/lembrete.
+           → acesso ativo → isenção → desafios WebAuthn persistidos → timers/lembrete;
+   run 3 — fluxo Cakto: checkout Pix automático (API mockada), validação de pagador,
+           webhook assinado (HMAC) aprova sozinho, idempotência, revogação por reembolso.
    Uso: node scripts/smoke-serverless.mjs   (a partir da raiz do repo)         */
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -173,9 +176,175 @@ async function run2() {
   } finally { child.kill('SIGKILL'); }
 }
 
+/* ---------- run 3: fluxo Cakto (API mockada + webhook assinado) ---------- */
+
+/* Mock mínimo da API pública do Cakto: POST /token/ e POST /payments/. */
+function mockCakto(port) {
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', d => chunks.push(d));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (req.url.startsWith('/token/')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ access_token: 'mock-jwt-token', token_type: 'Bearer', expires_in: 36000, scope: 'read write payments' }));
+      }
+      if (req.url.startsWith('/payments/')) {
+        if (req.headers['authorization'] !== 'Bearer mock-jwt-token') { res.writeHead(401); return res.end(JSON.stringify({ detail: 'As credenciais de autenticação não foram fornecidas.' })); }
+        if (!req.headers['x-idempotency-key']) { res.writeHead(400); return res.end(JSON.stringify({ detail: 'Header X-Idempotency-Key é obrigatório.' })); }
+        const body = JSON.parse(raw || '{}');
+        res.writeHead(201, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          id: 'mock-' + crypto.randomBytes(6).toString('hex'),
+          refId: 'MOCK' + crypto.randomBytes(3).toString('hex').toUpperCase(),
+          status: 'waiting_payment',
+          paymentMethod: 'pix',
+          amount: '14.90',
+          baseAmount: '14.90',
+          discount: '0.00',
+          fees: '0.00',
+          checkoutUrl: 'https://pay.cakto.com.br/MOCKTEST',
+          createdAt: new Date().toISOString(),
+          product: { id: 'prod-mock', short_id: 'mp1', name: 'openGym — Plano Mensal' },
+          offer: { id: body?.items?.[0]?.offerId || 'cvgtest', name: 'openGym — Plano Mensal', price: 14.9 },
+          pix: { qrCode: '00020126BR.GOV.BCB.PIX0114MOCKMOCKMOCKMOCK5204000053039865802BR6009SAO PAULO62070503***6304ABCD', expirationDate: new Date(Date.now() + 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19) + '+00:00' },
+          user_journey: null
+        }));
+      }
+      res.writeHead(404); res.end('{}');
+    });
+  });
+  return new Promise(resolve => server.listen(port, '127.0.0.1', () => resolve(server)));
+}
+
+/* Assina um payload de webhook exatamente como a Cakto faz:
+   X-Cakto-Signature: v1=HMAC-SHA256(secret, '{timestamp}.{rawBody}') */
+function signedWebhookHeaders(secret, body) {
+  const raw = JSON.stringify(body);
+  const ts = String(Math.floor(Date.now() / 1000));
+  const sig = crypto.createHmac('sha256', secret).update(ts + '.' + raw).digest('hex');
+  return { headers: { ...J, 'X-Cakto-Timestamp': ts, 'X-Cakto-Signature': 'v1=' + sig }, raw };
+}
+
+async function run3() {
+  console.log('\n— Run 3: Cakto — Pix automático + webhook assinado —');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ogsmoke3-'));
+  const past = new Date(Date.now() - 3 * 86400000).toISOString();
+  tempDb(dir, { users: [{ id: 'u3', name: 'Aluna Vencida', created: past, billing: { status: 'trial', free: false, trialEndsAt: past, periodEnd: null } }], creds: [], subs: [], invites: [] });
+  const WHSEC = 'whsec-test-0000';
+  const mock = await mockCakto(3315);
+  const child = spawn('node', ['scripts/dev-serverless.mjs'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PORT: String(3316), DATA_BACKEND: 'fs', DATA_DIR: dir,
+      RP_ID: 'localhost', ORIGIN: `http://localhost:3316`,
+      ADMIN_USERNAME: 'dono', ADMIN_PASSWORD: 'senhaforte123',
+      TRIAL_DAYS: '7', PRICE_MONTHLY: '14.90', APP_BRAND: 'openGym',
+      VAPID_SUBJECT: 'mailto:smoke@teste',
+      CAKTO_CLIENT_ID: 'cid-teste', CAKTO_CLIENT_SECRET: 'csec-teste', CAKTO_OFFER_ID: 'cvgtest',
+      CAKTO_WEBHOOK_SECRET: WHSEC, CAKTO_BASE_URL: 'http://127.0.0.1:3315/'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  child.stderr.on('data', d => process.env.SMOKE_DEBUG && process.stderr.write(d));
+  const base = 'http://localhost:3316';
+  try {
+    await waitHealth(3316);
+    const cfg = await (await fetch(base + '/api/config')).json();
+    ok(cfg.billing?.method === 'cakto', `config: método de pagamento → ${cfg.billing?.method}`);
+    ok(!JSON.stringify(cfg).includes('csec-teste'), 'config pública não vaza credenciais');
+
+    const cookie = sessionCookie(dir, 'u3');
+    // valida pagador: e-mail ausente/inválido, telefone, CPF
+    const c1 = await fetch(base + '/api/billing/checkout', { method: 'POST', headers: { ...J, cookie }, body: '{}' });
+    ok(c1.status === 400 && (await c1.json()).field === 'email', 'checkout sem e-mail → 400 (field=email)');
+    const c2 = await fetch(base + '/api/billing/checkout', { method: 'POST', headers: { ...J, cookie }, body: JSON.stringify({ email: 'aluna@teste.com', phone: '123' }) });
+    ok(c2.status === 400 && (await c2.json()).field === 'phone', 'telefone inválido → 400 (field=phone)');
+    const c3 = await fetch(base + '/api/billing/checkout', { method: 'POST', headers: { ...J, cookie }, body: JSON.stringify({ email: 'aluna@teste.com', phone: '(11) 91234-5678', docNumber: '11111111111' }) });
+    ok(c3.status === 400 && (await c3.json()).field === 'docNumber', 'CPF dígito verificador inválido → 400 (field=docNumber)');
+
+    // checkout válido → cobrança Pix do mock
+    const ck = await (await fetch(base + '/api/billing/checkout', {
+      method: 'POST', headers: { ...J, cookie },
+      body: JSON.stringify({ email: 'Aluna@Teste.com', phone: '(11) 91234-5678', docNumber: '529.982.247-25' })
+    })).json();
+    ok(ck.payment?.status === 'pending' && ck.payment?.method === 'cakto', `checkout cakto: ${ck.payment?.status}/${ck.payment?.method}`);
+    ok((ck.payment?.qrCode || '').startsWith('00020126'), 'payment traz o BR Code (copia-e-cola)');
+    ok(ck.payment?.checkoutUrl === 'https://pay.cakto.com.br/MOCKTEST', 'payment traz o checkoutUrl da Cakto');
+    ok(!ck.pix, 'fluxo cakto não devolve chave Pix manual');
+
+    // restauração da pendência depois de recarregar a página
+    const pend = await (await fetch(base + '/api/billing/pending', { headers: { cookie } })).json();
+    ok(pend.payment?.id === ck.payment.id && pend.payment?.qrCode === ck.payment.qrCode, 'GET /api/billing/pending restaura o QR');
+
+    // idempotência do checkout (mesma cobrança pendente)
+    const ck2 = await (await fetch(base + '/api/billing/checkout', {
+      method: 'POST', headers: { ...J, cookie },
+      body: JSON.stringify({ email: 'aluna@teste.com', phone: '11 91234-5678', docNumber: '52998224725' })
+    })).json();
+    ok(ck2.payment?.id === ck.payment.id, 'checkout cakto é idempotente');
+
+    // webhook rejeitado sem verificação válida / com assinatura errada
+    const whBody = { secret: WHSEC, event: 'purchase_approved', data: { id: ck.payment.caktoId, refId: ck.payment.refId, status: 'paid', amount: 14.9, paymentMethod: 'pix', customer: { email: 'aluna@teste.com' }, product: {}, offer: {} } };
+    const noAuth = { ...whBody, secret: undefined }; delete noAuth.secret;   // sem secret no corpo
+    const w0 = await fetch(base + '/api/billing/webhook', { method: 'POST', headers: J, body: JSON.stringify(noAuth) });
+    ok(w0.status === 403, 'webhook sem assinatura de header e sem secret no corpo → 403');
+    const wrong = signedWebhookHeaders('segredo-errado', noAuth);
+    const w1 = await fetch(base + '/api/billing/webhook', { method: 'POST', headers: wrong.headers, body: wrong.raw });
+    ok(w1.status === 403, 'webhook com assinatura inválida → 403');
+
+    // aprovação: /api/me ainda overdue antes do webhook
+    const me0 = await (await fetch(base + '/api/me', { headers: { cookie } })).json();
+    ok(me0.user?.billing?.code === 'overdue', 'antes do webhook: overdue');
+
+    // caminho 1 (fallback da doc): assinatura de header errada + secret correto no corpo
+    const fallback = signedWebhookHeaders('segredo-errado', whBody);
+    const w2 = await fetch(base + '/api/billing/webhook', { method: 'POST', headers: fallback.headers, body: fallback.raw });
+    const w2j = await w2.json();
+    ok(w2.status === 200 && w2j.ok === true && w2j.outcome === 'approved', `webhook (fallback secret no corpo) → ${w2j.outcome}`);
+    const me1 = await (await fetch(base + '/api/me', { headers: { cookie } })).json();
+    ok(me1.user?.billing?.code === 'active', 'após webhook: assinatura ativa');
+    const put = await fetch(base + '/api/data', { method: 'PUT', headers: { ...J, cookie }, body: JSON.stringify({ state: { unit: 'kg' } }) });
+    ok(put.status === 200, 'PUT /api/data liberado após aprovação automática');
+    const periodEnd1 = me1.user?.billing?.periodEnd;
+
+    // idempotência do webhook: repetir o evento (agora com assinatura de header correta) não prorroga duas vezes
+    const good = signedWebhookHeaders(WHSEC, whBody);
+    const w3 = await fetch(base + '/api/billing/webhook', { method: 'POST', headers: good.headers, body: good.raw });
+    const w3j = await w3.json();
+    ok(w3j.outcome === 'already-approved', 'webhook repetido → already-approved');
+    const me2 = await (await fetch(base + '/api/me', { headers: { cookie } })).json();
+    ok(me2.user?.billing?.periodEnd === periodEnd1, 'periodEnd não avança na repetição');
+
+    // reembolso → revoga o acesso
+    const refund = { secret: WHSEC, event: 'refund', data: { id: ck.payment.caktoId, refId: ck.payment.refId, status: 'refunded', amount: 14.9, customer: { email: 'aluna@teste.com' } } };
+    const goodR = signedWebhookHeaders(WHSEC, refund);
+    const w4 = await fetch(base + '/api/billing/webhook', { method: 'POST', headers: goodR.headers, body: goodR.raw });
+    ok((await w4.json()).outcome === 'revoked', 'webhook refund → revogado');
+    const me3 = await (await fetch(base + '/api/me', { headers: { cookie } })).json();
+    ok(me3.user?.billing?.code === 'overdue', 'após reembolso: acesso cortado');
+    const put2 = await fetch(base + '/api/data', { method: 'PUT', headers: { ...J, cookie }, body: JSON.stringify({ state: { unit: 'kg', _ts: 9 } }) });
+    ok(put2.status === 402, 'PUT /api/data bloqueado de novo (402)');
+
+    // venda direta no checkout público da Cakto (sem cobrança local): casa por e-mail
+    const direct = { secret: WHSEC, event: 'purchase_approved', data: { id: 'mock-direct-01', refId: 'MOCKD1', status: 'paid', amount: 14.9, paymentMethod: 'credit_card', customer: { name: 'Aluna Vencida', email: 'aluna@teste.com' }, product: { id: 'prod-mock' }, offer: { id: 'cvgtest' } } };
+    const goodD = signedWebhookHeaders(WHSEC, direct);
+    const w5 = await fetch(base + '/api/billing/webhook', { method: 'POST', headers: goodD.headers, body: goodD.raw });
+    const w5j = await w5.json();
+    ok(w5j.outcome === 'approved', `venda direta no checkout → ${w5j.outcome} (casada por e-mail)`);
+    const me4 = await (await fetch(base + '/api/me', { headers: { cookie } })).json();
+    ok(me4.user?.billing?.code === 'active', 'venda direta liberou o acesso');
+  } finally {
+    child.kill('SIGKILL');
+    mock.close();
+  }
+}
+
 try {
   await run1();
   await run2();
+  await run3();
 } catch (e) {
   console.error('ERRO:', e.message);
   failures++;

@@ -64,3 +64,31 @@
 .bi-foot button{background:none;border:0;color:var(--acc);font:inherit;font-size:13.5px;cursor:pointer;padding:4px 2px}
 .bi-dot{color:var(--label-4)}
 .bi-user{margin-top:12px;font-size:12.5px}
+
+/* ---------- fluxo Cakto: formulário do pagador + QR do Pix ---------- */
+.bi-field{display:block;text-align:left;margin-bottom:10px}
+.bi-field span{display:block;color:var(--label-3);font-size:12px;margin-bottom:5px}
+.bi-field input{
+  width:100%;box-sizing:border-box;background:var(--bg-el);border:1px solid var(--surface-2);
+  border-radius:var(--r);padding:12px 14px;color:var(--label);font:inherit;font-size:14.5px;
+}
+.bi-field input:focus{outline:none;border-color:var(--acc)}
+.bi-field input::placeholder{color:var(--label-4)}
+
+.bi-qrcode{text-align:center;background:var(--bg-el);border-radius:var(--r);padding:18px 14px}
+.bi-qrcode-head{display:flex;align-items:baseline;justify-content:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.bi-qrcode-head strong{font-size:15.5px}
+.bi-qrcode-ref{color:var(--label-3);font-size:12px}
+.bi-qrcode-img{
+  display:block;margin:0 auto 12px;background:#fff;border-radius:10px;padding:10px;
+  width:220px;height:220px;object-fit:contain;
+}
+.bi-brcode{
+  text-align:left;background:var(--surface-2);border-radius:10px;padding:10px 12px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.5;
+  color:var(--label-2);word-break:break-all;user-select:all;max-height:88px;overflow:auto;margin:12px 0;
+}
+.bi-qrcode-actions{display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;margin:4px 0 14px}
+.bi-checkout-link{color:var(--acc);font-size:13px;text-decoration:none;border-bottom:1px dashed color-mix(in srgb,var(--acc) 45%,transparent);padding-bottom:1px}
+.bi-regen{background:none;border:0;color:var(--label-3);font:inherit;font-size:12.5px;cursor:pointer;margin-top:10px;padding:4px 2px;text-decoration:underline;text-underline-offset:3px}
+.bi-regen:disabled{opacity:.5;cursor:default}
